@@ -12,4 +12,5 @@ pub mod kube;
 pub mod lease;
 pub mod mac;
 pub mod subnet;
+pub mod trafficmngr;
 pub mod utils;
