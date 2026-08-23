@@ -1,0 +1,17 @@
+[package]
+name = "flanneld"
+description = "flannel node agent (drop-in compatible CLI with upstream flanneld)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flanneld"
+path = "src/main.rs"
+
+[dependencies]
+flannel-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

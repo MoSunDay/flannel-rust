@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flannel-core",
+    "crates/flannel-cni",
+    "crates/flanneld",
+    "crates/flannel",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/flannel-io/flannel"
+
+[workspace.dependencies]
+flannel-core = { path = "crates/flannel-core" }
+flannel-cni = { path = "crates/flannel-cni" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ipnet = { version = "2", features = ["serde"] }
+nix = { version = "0.29", features = ["net", "socket", "ioctl", "fs", "process", "signal", "user"] }
+libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+regex = "1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+
+[profile.release]
+strip = true
