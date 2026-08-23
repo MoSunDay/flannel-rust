@@ -20,6 +20,9 @@ futures.workspace = true
 regex.workspace = true
 url.workspace = true
 uuid.workspace = true
+rtnetlink.workspace = true
+netlink-packet-route.workspace = true
+netns-rs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
