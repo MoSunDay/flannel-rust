@@ -26,6 +26,9 @@ async-stream.workspace = true
 rtnetlink.workspace = true
 netlink-packet-route.workspace = true
 netns-rs.workspace = true
+curve25519-dalek.workspace = true
+base64.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
