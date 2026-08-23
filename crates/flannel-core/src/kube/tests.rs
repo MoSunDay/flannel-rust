@@ -106,10 +106,10 @@ async fn list_or_watch(Query(params): Query<HashMap<String, String>>) -> Respons
 }
 
 /// Watch endpoint:
-/// - resourceVersion=1    -> immediate 410 Gone with Status body
+/// - resourceVersion=1 -> immediate 410 Gone with Status body
 /// - resourceVersion=hang -> one event, then the stream stays open
-/// - otherwise            -> one ADDED event split across two chunks plus
-///                           one MODIFIED event, then close.
+/// - otherwise -> one ADDED event split across two chunks plus one
+///   MODIFIED event, then close.
 fn watch_response(params: &HashMap<String, String>) -> Response {
     let rv = params.get("resourceVersion").map(String::as_str);
     if rv == Some("1") {
@@ -134,8 +134,8 @@ fn watch_response(params: &HashMap<String, String>) -> Response {
     } else {
         let mid = first.len() / 2;
         vec![
-            Ok(first[..mid].as_bytes().to_vec()),
-            Ok(first[mid..].as_bytes().to_vec()),
+            Ok(first.as_bytes()[..mid].to_vec()),
+            Ok(first.as_bytes()[mid..].to_vec()),
             Ok(second.into_bytes()),
         ]
     };

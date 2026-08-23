@@ -255,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn crlf_line_endings_tolerated() {
         let mut data = frame("ADDED", node_obj("node1", "10"));
-        data.insert_str(data.len() - 1, "\r"); // ends with \r\n
+        data.insert(data.len() - 1, '\r'); // ends with \r\n
         let events = decode_chunks(vec![data.into_bytes()]).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].object.metadata.name, "node1");
@@ -280,10 +280,7 @@ mod tests {
     async fn upstream_chunk_error_is_surfaced() {
         let s = stream::iter(vec![
             Ok::<_, std::io::Error>(frame("ADDED", node_obj("n", "1")).into_bytes()),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "connection reset",
-            )),
+            Err(std::io::Error::other("connection reset")),
         ]);
         let err: KubeError = decode_watch_stream(s)
             .try_collect::<Vec<_>>()
