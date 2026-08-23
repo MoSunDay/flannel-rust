@@ -16,6 +16,7 @@ repository = "https://github.com/flannel-io/flannel"
 [workspace.dependencies]
 flannel-core = { path = "crates/flannel-core" }
 flannel-cni = { path = "crates/flannel-cni" }
+flanneld = { path = "crates/flanneld" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

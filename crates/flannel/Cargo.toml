@@ -12,3 +12,18 @@ path = "src/main.rs"
 [dependencies]
 flannel-cni.workspace = true
 anyhow.workspace = true
+
+# `tests/dropin_e2e/main.rs` is auto-discovered by Cargo (directory-style
+# test with main.rs, like flanneld's e2e_daemon), so no [[test]] entry.
+[dev-dependencies]
+flanneld.workspace = true
+flannel-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tempfile.workspace = true
+netns-rs.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+axum = "0.8"
