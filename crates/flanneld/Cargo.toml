@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "flanneld"
+path = "src/lib.rs"
+
 [[bin]]
 name = "flanneld"
 path = "src/main.rs"
@@ -13,5 +17,14 @@ path = "src/main.rs"
 flannel-core.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+futures.workspace = true
+nix.workspace = true
+axum = "0.8"
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
