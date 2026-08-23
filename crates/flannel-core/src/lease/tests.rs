@@ -143,7 +143,7 @@ fn reset_replace_same_subnet_emits_nothing() {
 
     // Updated lease for the same subnet: consumed silently, list refreshed.
     let a2 = lease_with_public_ip(true, false, V4A, V6ZERO, "192.168.1.2");
-    let batch = lw.reset(&[a2.clone()]);
+    let batch = lw.reset(std::slice::from_ref(&a2));
 
     assert!(batch.is_empty());
     assert_eq!(lw.leases, vec![a2]);
@@ -156,7 +156,7 @@ fn reset_removed_lease_emits_removed() {
     let b = lease(true, false, V4B, V6ZERO);
     lw.leases = vec![a.clone(), b.clone()];
 
-    let batch = lw.reset(&[a.clone()]);
+    let batch = lw.reset(std::slice::from_ref(&a));
 
     assert_eq!(batch, vec![removed(b)]);
     assert_eq!(lw.leases, vec![a]);
