@@ -12,9 +12,11 @@ pub mod common;
 pub mod extension;
 pub mod hostgw;
 pub mod ipip;
+pub mod ipsec;
 pub mod manager;
 pub mod route_network;
 pub mod simple_network;
+pub mod tencentvpc;
 pub mod traits;
 pub mod udp;
 pub mod vxlan;
@@ -38,10 +40,9 @@ pub fn default_registry(mgr: &mut BackendManager) {
     mgr.register("wireguard", Box::new(wireguard::new_backend));
     mgr.register("udp", Box::new(udp::new_backend));
     mgr.register("extension", Box::new(extension::new_backend));
-    // TODO: register the remaining upstream backends as their ports
-    // land, one line each:
-    //   mgr.register("ipsec", Box::new(ipsec::new_backend));
-    //   mgr.register("tencentvpc", Box::new(tencentvpc::new_backend));
+    // Go: ipsec.init() and tencentvpc.init() register these names.
+    mgr.register("ipsec", Box::new(ipsec::new_backend));
+    mgr.register("tencent-vpc", Box::new(tencentvpc::new_backend));
 }
 
 #[cfg(test)]
@@ -151,22 +152,18 @@ mod tests {
         default_registry(&mut mgr);
         // Default ExternalInterface has ExtAddr == IfaceAddr (both None),
         // so host-gw's NAT check passes; ipip has no constructor checks.
-        for name in ["host-gw", "ipip", "vxlan", "wireguard", "udp", "extension"] {
+        for name in [
+            "host-gw",
+            "ipip",
+            "vxlan",
+            "wireguard",
+            "udp",
+            "extension",
+            "ipsec",
+            "tencent-vpc",
+        ] {
             let be = mgr.create(name, Arc::new(ExternalInterface::default()));
             assert!(be.is_ok(), "{name} should be registered");
-        }
-    }
-
-    #[test]
-    fn default_registry_other_backends_not_registered_yet() {
-        let mut mgr = BackendManager::new(Arc::new(NoopManager));
-        default_registry(&mut mgr);
-        for name in ["ipsec", "tencentvpc"] {
-            let err = mgr
-                .create(name, Arc::new(ExternalInterface::default()))
-                .err()
-                .unwrap();
-            assert_eq!(err.to_string(), format!("unknown backend type: {name}"));
         }
     }
 }

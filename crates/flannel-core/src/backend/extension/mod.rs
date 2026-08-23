@@ -20,6 +20,10 @@
 //!   skipped here instead of panicking.
 //! - Go's `CombinedOutput` interleaves stdout/stderr in arrival order;
 //!   this port concatenates stdout then stderr.
+//! - Writing the child's stdin tolerates `BrokenPipe`: a fast-exiting
+//!   child can close its stdin before the write lands. Go surfaces that
+//!   EPIPE as an error; here the child's own status/output is returned
+//!   instead (see `run_cmd`).
 //! - Unset `PublicIPv6` prints as the literal `<nil>` (Go's nil net.IP
 //!   formatting, kept for parity). Unset `PublicIP` prints `0.0.0.0`
 //!   where Go would print `<nil>` (the Rust `IP4` is non-optional).
@@ -319,9 +323,18 @@ fn run_cmd(env: &[String], stdin: &str, program: &str, args: &[&str]) -> anyhow:
     let mut child = cmd.spawn().map_err(|e| spawn_err(name, e))?;
     if let Some(mut si) = child.stdin.take() {
         // Go: io.WriteString(pipe, stdin), io.WriteString(pipe, "\n"),
-        // then Close.
-        si.write_all(stdin.as_bytes())?;
-        si.write_all(b"\n")?;
+        // then Close. A fast-exiting child can win the race and close
+        // stdin before this write lands; BrokenPipe is benign there --
+        // the child's own status/output below is the meaningful result
+        // (Go surfaces the EPIPE instead; documented deviation).
+        let res = si
+            .write_all(stdin.as_bytes())
+            .and_then(|_| si.write_all(b"\n"));
+        if let Err(e) = res {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(e.into());
+            }
+        }
     }
     let out = child.wait_with_output()?;
 
