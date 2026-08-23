@@ -292,6 +292,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flannel-core",
+ "libc",
+ "netns-rs",
  "serde",
  "serde_json",
  "tempfile",

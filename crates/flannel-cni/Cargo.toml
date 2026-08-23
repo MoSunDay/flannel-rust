@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc.workspace = true
 flannel-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
@@ -14,3 +15,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+netns-rs.workspace = true
