@@ -9,13 +9,16 @@
 
 pub mod alloc;
 pub mod common;
+pub mod extension;
 pub mod hostgw;
 pub mod ipip;
 pub mod manager;
 pub mod route_network;
 pub mod simple_network;
 pub mod traits;
+pub mod udp;
 pub mod vxlan;
+pub mod wireguard;
 
 pub use common::ExternalInterface;
 pub use manager::BackendManager;
@@ -31,13 +34,14 @@ pub fn default_registry(mgr: &mut BackendManager) {
     mgr.register("ipip", Box::new(ipip::new_backend));
     // Go: vxlan.init() registers this name.
     mgr.register("vxlan", Box::new(vxlan::new_backend));
+    // Go: wireguard.init(), udp.init(), extension.init() register these.
+    mgr.register("wireguard", Box::new(wireguard::new_backend));
+    mgr.register("udp", Box::new(udp::new_backend));
+    mgr.register("extension", Box::new(extension::new_backend));
     // TODO: register the remaining upstream backends as their ports
     // land, one line each:
-    //   mgr.register("wireguard", Box::new(wireguard::new_backend));
     //   mgr.register("ipsec", Box::new(ipsec::new_backend));
-    //   mgr.register("udp", Box::new(udp::new_backend));
     //   mgr.register("tencentvpc", Box::new(tencentvpc::new_backend));
-    //   mgr.register("extension", Box::new(extension::new_backend));
 }
 
 #[cfg(test)]
@@ -147,7 +151,7 @@ mod tests {
         default_registry(&mut mgr);
         // Default ExternalInterface has ExtAddr == IfaceAddr (both None),
         // so host-gw's NAT check passes; ipip has no constructor checks.
-        for name in ["host-gw", "ipip", "vxlan"] {
+        for name in ["host-gw", "ipip", "vxlan", "wireguard", "udp", "extension"] {
             let be = mgr.create(name, Arc::new(ExternalInterface::default()));
             assert!(be.is_ok(), "{name} should be registered");
         }
@@ -157,7 +161,7 @@ mod tests {
     fn default_registry_other_backends_not_registered_yet() {
         let mut mgr = BackendManager::new(Arc::new(NoopManager));
         default_registry(&mut mgr);
-        for name in ["wireguard", "ipsec", "udp", "tencentvpc", "extension"] {
+        for name in ["ipsec", "tencentvpc"] {
             let err = mgr
                 .create(name, Arc::new(ExternalInterface::default()))
                 .err()

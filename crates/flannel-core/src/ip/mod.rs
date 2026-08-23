@@ -3,6 +3,7 @@
 pub mod iface;
 pub mod ip6net;
 pub mod ipnet;
+pub mod tun;
 
 pub use iface::{NetIface, Netlink};
 pub use ip6net::{IP6Net, IP6};
