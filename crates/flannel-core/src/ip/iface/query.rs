@@ -184,7 +184,7 @@ fn default_gateway_iface(
                 Some(dst) => dst == zero && r.header.destination_prefix_length == 0,
             }
     };
-    for route in routes.iter().filter(|r| is_default(r)) {
+    if let Some(route) = routes.iter().find(|r| is_default(r)) {
         let oif = route_oif(route).unwrap_or(0);
         if oif == 0 {
             bail!("{no_iface_err}");
@@ -307,7 +307,7 @@ pub async fn get_interface_by_specific_ip_routing(
         .await
         .map_err(|e| anyhow!("couldn't lookup route to {ip}: {e}"))?;
     let links = list_links(nl).await?;
-    for route in &routes {
+    if let Some(route) = routes.first() {
         let oif = route_oif(route).unwrap_or(0);
         if oif == 0 {
             bail!("couldn't lookup interface: no such network interface with index 0");
