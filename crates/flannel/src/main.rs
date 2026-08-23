@@ -1,3 +1,6 @@
+//! flannel CNI plugin binary (drop-in for the flannel-io/cni-plugin `flannel`
+//! meta-plugin). Speaks the CNI exec protocol; all logic in `flannel-cni`.
+
 fn main() {
-    println!("flannel CNI plugin: not yet implemented");
+    std::process::exit(flannel_cni::skel::run());
 }
