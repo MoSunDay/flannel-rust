@@ -4,6 +4,7 @@
 //! plain structs for data, free functions for logic, traits only where
 //! polymorphism is genuinely required (backends, subnet managers).
 
+pub mod backend;
 pub mod flags;
 pub mod ip;
 pub mod ipmatch;
