@@ -8,6 +8,7 @@ pub mod backend;
 pub mod flags;
 pub mod ip;
 pub mod ipmatch;
+pub mod kube;
 pub mod lease;
 pub mod mac;
 pub mod subnet;

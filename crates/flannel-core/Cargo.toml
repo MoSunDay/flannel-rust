@@ -20,6 +20,9 @@ futures.workspace = true
 regex.workspace = true
 url.workspace = true
 uuid.workspace = true
+tokio-util.workspace = true
+serde_yaml.workspace = true
+async-stream.workspace = true
 rtnetlink.workspace = true
 netlink-packet-route.workspace = true
 netns-rs.workspace = true
@@ -27,3 +30,6 @@ netns-rs.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+axum = "0.8"
+hyper = { version = "1", features = ["server"] }
+tower = "0.5"
