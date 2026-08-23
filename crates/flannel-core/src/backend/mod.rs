@@ -1,15 +1,21 @@
 //! Backend package. Port of flannel `pkg/backend`.
 //!
-//! P1 scope: the backend framework skeleton (`common`, `traits`,
-//! `manager`, `simple_network`) plus the `alloc` backend. The remaining
-//! upstream backends land in P2-P5; each is a new module plus a
-//! one-liner in [`default_registry`].
+//! Ported so far: the backend framework skeleton (`common`, `traits`,
+//! `manager`, `simple_network`), the `alloc` backend, and the two
+//! route-based backends (`hostgw`, `ipip`) built on the shared
+//! [`route_network`] port. The remaining upstream backends land in
+//! later phases; each is a new module plus a one-liner in
+//! [`default_registry`].
 
 pub mod alloc;
 pub mod common;
+pub mod hostgw;
+pub mod ipip;
 pub mod manager;
+pub mod route_network;
 pub mod simple_network;
 pub mod traits;
+pub mod vxlan;
 
 pub use common::ExternalInterface;
 pub use manager::BackendManager;
@@ -20,14 +26,16 @@ pub use traits::{Backend, BackendCtor, Network};
 /// `init()` `backend.Register` calls scattered over the backend packages).
 pub fn default_registry(mgr: &mut BackendManager) {
     mgr.register("alloc", Box::new(alloc::new_backend));
-    // TODO(P2-P5): register the remaining upstream backends as their
-    // ports land, one line each:
-    //   mgr.register("vxlan", Box::new(vxlan::new_backend));
-    //   mgr.register("host-gw", Box::new(hostgw::new_backend));
+    // Go: hostgw.init() and ipip.init() register these names.
+    mgr.register("host-gw", Box::new(hostgw::new_backend));
+    mgr.register("ipip", Box::new(ipip::new_backend));
+    // Go: vxlan.init() registers this name.
+    mgr.register("vxlan", Box::new(vxlan::new_backend));
+    // TODO: register the remaining upstream backends as their ports
+    // land, one line each:
     //   mgr.register("wireguard", Box::new(wireguard::new_backend));
     //   mgr.register("ipsec", Box::new(ipsec::new_backend));
     //   mgr.register("udp", Box::new(udp::new_backend));
-    //   mgr.register("ipip", Box::new(ipip::new_backend));
     //   mgr.register("tencentvpc", Box::new(tencentvpc::new_backend));
     //   mgr.register("extension", Box::new(extension::new_backend));
 }
@@ -134,19 +142,22 @@ mod tests {
     }
 
     #[test]
+    fn default_registry_registers_host_gw_and_ipip() {
+        let mut mgr = BackendManager::new(Arc::new(NoopManager));
+        default_registry(&mut mgr);
+        // Default ExternalInterface has ExtAddr == IfaceAddr (both None),
+        // so host-gw's NAT check passes; ipip has no constructor checks.
+        for name in ["host-gw", "ipip", "vxlan"] {
+            let be = mgr.create(name, Arc::new(ExternalInterface::default()));
+            assert!(be.is_ok(), "{name} should be registered");
+        }
+    }
+
+    #[test]
     fn default_registry_other_backends_not_registered_yet() {
         let mut mgr = BackendManager::new(Arc::new(NoopManager));
         default_registry(&mut mgr);
-        for name in [
-            "vxlan",
-            "host-gw",
-            "wireguard",
-            "ipsec",
-            "udp",
-            "ipip",
-            "tencentvpc",
-            "extension",
-        ] {
+        for name in ["wireguard", "ipsec", "udp", "tencentvpc", "extension"] {
             let err = mgr
                 .create(name, Arc::new(ExternalInterface::default()))
                 .err()
