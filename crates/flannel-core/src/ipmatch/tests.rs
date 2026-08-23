@@ -2,10 +2,10 @@ use super::*;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 fn opts(public_ip: &str, public_ip_v6: &str) -> PublicIPOpts {
-    let mut o = PublicIPOpts::default();
-    o.public_ip = public_ip.into();
-    o.public_ip_v6 = public_ip_v6.into();
-    o
+    PublicIPOpts {
+        public_ip: public_ip.into(),
+        public_ip_v6: public_ip_v6.into(),
+    }
 }
 
 #[test]
