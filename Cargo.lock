@@ -283,7 +283,17 @@ name = "flannel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "flannel-cni",
+ "flannel-core",
+ "flanneld",
+ "futures",
+ "netns-rs",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing-subscriber",
 ]
 
 [[package]]
