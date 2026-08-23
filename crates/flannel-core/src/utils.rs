@@ -151,7 +151,7 @@ fn next_random() -> String {
 }
 
 fn other_err(msg: String) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, msg)
+    io::Error::other(msg)
 }
 
 fn quoted_path(path: &Path) -> String {
