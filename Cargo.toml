@@ -35,6 +35,9 @@ regex = "1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
+tokio-util = "0.7"
+serde_yaml = "0.9"
+async-stream = "0.3"
 
 [profile.release]
 strip = true
