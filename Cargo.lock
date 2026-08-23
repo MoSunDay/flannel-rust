@@ -264,8 +264,15 @@ name = "flanneld"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "flannel-core",
+ "futures",
+ "nix 0.29.0",
+ "reqwest",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
