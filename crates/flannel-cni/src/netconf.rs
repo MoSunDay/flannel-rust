@@ -182,6 +182,13 @@ pub fn build_delegate_conf(conf: &NetConf, env: &FlannelSubnetEnv) -> Result<Val
     for (key, val) in &conf.delegate {
         delegate.insert(key.clone(), val.clone());
     }
+    // Upstream (flannel_linux.go): bridge delegates default isGateway to
+    // true unless the user supplied the key themselves.
+    if delegate.get("type").and_then(Value::as_str) == Some(DEFAULT_DELEGATE_TYPE)
+        && !delegate.contains_key("isGateway")
+    {
+        delegate.insert("isGateway".into(), json!(true));
+    }
     // Flannel always forces these two keys.
     delegate.insert("ipMasq".into(), json!(false));
     if let Some(mtu) = env.mtu {

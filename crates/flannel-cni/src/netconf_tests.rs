@@ -128,6 +128,7 @@ fn delegate_conf_ranges_v4() {
     assert_eq!(value["name"], json!("ftest"));
     assert_eq!(value["type"], json!("bridge"));
     assert_eq!(value["ipMasq"], json!(false));
+    assert_eq!(value["isGateway"], json!(true)); // bridge default (upstream)
     assert!(value.get("mtu").is_none()); // FLANNEL_MTU absent -> no mtu
     assert_eq!(
         value["ipam"]["ranges"],
@@ -207,7 +208,8 @@ fn delegate_conf_no_subnet_errors() {
 fn delegate_conf_user_overrides_preserved_but_ipmasq_mtu_forced() {
     let conf = netconf(
         "0.4.0",
-        json!({"hairpinMode": true, "ipMasq": true, "mtu": 9999, "isDefaultGateway": true}),
+        json!({"hairpinMode": true, "ipMasq": true, "mtu": 9999,
+              "isDefaultGateway": true, "isGateway": false}),
     );
     let env = FlannelSubnetEnv {
         mtu: Some(1450),
@@ -216,6 +218,7 @@ fn delegate_conf_user_overrides_preserved_but_ipmasq_mtu_forced() {
     let value = build_delegate_conf(&conf, &env).unwrap();
     assert_eq!(value["hairpinMode"], json!(true));
     assert_eq!(value["isDefaultGateway"], json!(true));
+    assert_eq!(value["isGateway"], json!(false)); // user value survives
     assert_eq!(value["ipMasq"], json!(false)); // forced false
     assert_eq!(value["mtu"], json!(1450)); // forced from subnet.env
                                            // Without FLANNEL_MTU the user mtu override survives (upstream only
