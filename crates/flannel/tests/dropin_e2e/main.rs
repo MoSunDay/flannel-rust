@@ -286,24 +286,44 @@ async fn dropin_daemon_subnet_env_cni_pod_veth() {
     let plugins_dir = tempfile::tempdir().unwrap();
     extract_plugins(plugins_dir.path());
 
-    // 6. Fresh netns for the "pod".
+    // 6. Fresh netns for the "pod", plus a scratch netns standing in for
+    //    the container runtime's (host) side: the delegated bridge plugin
+    //    creates cni0 in its *caller's* namespace, so executing the CNI
+    //    chain inside the scratch netns keeps it off the real host (which
+    //    may already have a cni0, e.g. under k3s) and it dies with the ns.
     let ns_name = format!("dropin-e2e-{}", unique_suffix());
     let ns = NsGuard::create(&ns_name);
     let ns_path = ns.path();
+    let host_ns_name = format!("dropin-e2e-host-{}", unique_suffix());
+    // Bound as `_`-prefixed: never read by name, but must stay alive
+    // until test end so the scratch netns exists for the children and is
+    // removed on Drop.
+    let _host_ns = NsGuard::create(&host_ns_name);
 
     // 7+9. CNI ADD then DEL through the real flannel binary. Blocking
-    //      child I/O runs off-runtime so the daemon task stays polled.
+    //      child I/O runs off-runtime so the daemon task stays polled;
+    //      the children spawn inside the scratch host netns.
     let flannel_bin = env!("CARGO_BIN_EXE_flannel").to_string();
     let plugins_path = plugins_dir.path().to_path_buf();
     let subnet_path = subnet_file.clone();
-    let (add_out, del_out) = tokio::task::spawn_blocking(move || {
-        let add = run_cni("ADD", &flannel_bin, &ns_path, &plugins_path, &subnet_path)?;
-        let del = run_cni("DEL", &flannel_bin, &ns_path, &plugins_path, &subnet_path)?;
-        anyhow::Ok((add, del))
-    })
-    .await
-    .expect("CNI child runs joined")
-    .unwrap_or_else(|e| panic!("CNI child run failed: {e:#}"));
+    let (add_out, del_out) = {
+        let host_ns_name = host_ns_name.clone();
+        tokio::task::spawn_blocking(move || {
+            let host_ns = netns_rs::NetNs::get(&host_ns_name)
+                .map_err(|e| anyhow::anyhow!("opening scratch host netns {host_ns_name:?}: {e}"))?;
+            host_ns
+                .run(|_| {
+                    let add = run_cni("ADD", &flannel_bin, &ns_path, &plugins_path, &subnet_path)?;
+                    let del = run_cni("DEL", &flannel_bin, &ns_path, &plugins_path, &subnet_path)?;
+                    anyhow::Ok((add, del))
+                })
+                .map_err(|e| anyhow::anyhow!("entering scratch host netns: {e}"))
+                .and_then(|r| r)
+        })
+        .await
+        .expect("CNI child runs joined")
+        .unwrap_or_else(|e| panic!("CNI child run failed: {e:#}"))
+    };
 
     // 8. ADD: exit 0 and a result with an eth0 IP in 10.244.9.0/24.
     assert!(
