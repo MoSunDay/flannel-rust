@@ -108,7 +108,10 @@ fn dispatch_add_del_with_fake_bridge() {
 }
 
 /// Full ADD + DEL through the real bridge/host-local plugins in a fresh
-/// netns: the result must carry an eth0 IP inside the leased subnet.
+/// netns: the whole chain runs *inside* the netns (like `ip netns exec`),
+/// so the bridge that cni-plugins >= 1.2 creates in the caller's
+/// namespace lands in the scratch netns and dies with it. The result
+/// must carry an eth0 IP inside the leased subnet.
 #[test]
 fn e2e_add_del_real_bridge_in_netns() {
     let _lock = ENV_LOCK.lock().unwrap();
@@ -157,11 +160,15 @@ fn e2e_add_del_real_bridge_in_netns() {
     };
     let conf = br#"{"cniVersion":"0.4.0","name":"ftest","type":"flannel"}"#;
 
-    let result = match flannel_cni::cmd_add(&args, conf) {
-        Ok(value) => value,
-        Err(e) => {
+    let result = match ns.run(|_| flannel_cni::cmd_add(&args, conf)) {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => {
             let _ = ns.remove();
             panic!("cmd_add failed: {e:#}");
+        }
+        Err(e) => {
+            let _ = ns.remove();
+            panic!("entering netns for cmd_add failed: {e:#}");
         }
     };
 
@@ -189,6 +196,10 @@ fn e2e_add_del_real_bridge_in_netns() {
         });
     assert!(has_ip, "no eth0 IP in {subnet}: {result}");
 
-    flannel_cni::cmd_del(&args, conf).unwrap_or_else(|e| panic!("cmd_del failed: {e:#}"));
+    match ns.run(|_| flannel_cni::cmd_del(&args, conf)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("cmd_del failed: {e:#}"),
+        Err(e) => panic!("entering netns for cmd_del failed: {e:#}"),
+    }
     let _ = ns.remove();
 }
