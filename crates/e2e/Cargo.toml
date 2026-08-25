@@ -1,0 +1,25 @@
+[package]
+name = "e2e"
+description = "Full closed-loop e2e harness: mock apiserver + real flanneld + real CNI, all capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flannel-e2e"
+path = "src/main.rs"
+
+[dependencies]
+flannel-core.workspace = true
+flanneld.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+netns-rs.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+tracing-subscriber.workspace = true
+async-stream.workspace = true
+axum = "0.8"
+libc.workspace = true
