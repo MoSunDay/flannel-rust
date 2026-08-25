@@ -5,6 +5,7 @@ members = [
     "crates/flannel-cni",
     "crates/flanneld",
     "crates/flannel",
+    "crates/e2e",
 ]
 
 [workspace.package]
