@@ -11,35 +11,42 @@
 //!
 //! Multi-value entries ("a,b,c") are comma-split exactly like Go.
 //!
-//! CIDR parsing uses Go `ip.ParseIP4Net`/`ParseIP6Net` semantics: host
-//! bits are KEPT (FLANNEL_SUBNET holds the first usable IP, e.g.
-//! `10.244.1.1/24`). That differs from `IP4Net`/`IP6Net`'s `FromStr`,
-//! which masks like `net.ParseCIDR`, hence the local helpers.
+//! CIDR parsing uses Go `net.ParseCIDR` + `ip.FromIPNet` semantics
+//! (main.go `ReadCIDRsFromSubnetFile` / `ReadIP6CIDRsFromSubnetFile`):
+//! host bits are MASKED, so a `FLANNEL_SUBNET=10.244.1.1/24` line (the
+//! lease address the daemon writes, first usable IP) reads back as the
+//! network `10.244.1.0/24`. That is what the prev-subnet comparisons
+//! and the masq-rule recycle in main.go expect (network-to-network).
+//! `IP4Net`/`IP6Net`'s `FromStr` masks the same way, but the local
+//! helpers keep the tolerant log-and-skip handling of the Go readers
+//! instead of failing the entry.
 
 use flannel_core::ip::{IP4Net, IP6Net, IP4, IP6};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 
-/// Go `ip.ParseIP4Net`: `a.b.c.d/len` -> [`IP4Net`], host bits kept.
-fn parse_ip4net_keep_host(s: &str) -> Option<IP4Net> {
+/// Go `net.ParseCIDR` + `ip.FromIPNet`: `a.b.c.d/len` -> [`IP4Net`],
+/// host bits masked to the network address.
+fn parse_ip4net(s: &str) -> Option<IP4Net> {
     let (addr, prefix) = s.split_once('/')?;
     let prefix_len: u32 = prefix.parse().ok()?;
     if prefix_len > 32 {
         return None;
     }
     let ip: IP4 = addr.parse().ok()?;
-    Some(IP4Net { ip, prefix_len })
+    Some(IP4Net { ip, prefix_len }.network())
 }
 
-/// Go `ip.ParseIP6Net`: `addr/len` -> [`IP6Net`], host bits kept.
-fn parse_ip6net_keep_host(s: &str) -> Option<IP6Net> {
+/// Go `net.ParseCIDR` + `ip.FromIP6Net`: `addr/len` -> [`IP6Net`],
+/// host bits masked to the network address.
+fn parse_ip6net(s: &str) -> Option<IP6Net> {
     let (addr, prefix) = s.rsplit_once('/')?;
     let prefix_len: u32 = prefix.parse().ok()?;
     if prefix_len > 128 {
         return None;
     }
     let ip: IP6 = addr.parse().ok()?;
-    Some(IP6Net { ip, prefix_len })
+    Some(IP6Net { ip, prefix_len }.network())
 }
 
 /// godotenv-equivalent file read. `Ok(None)` means the file does not
@@ -87,7 +94,7 @@ pub fn read_cidrs_from_subnet_file(path: &str, cidr_key: &str) -> Vec<IP4Net> {
     };
     let mut cidrs = Vec::new();
     for part in raw.split(',') {
-        match parse_ip4net_keep_host(part) {
+        match parse_ip4net(part) {
             Some(net) => cidrs.push(net),
             None => {
                 tracing::error!(
@@ -131,7 +138,7 @@ pub fn read_ip6_cidrs_from_subnet_file(path: &str, cidr_key: &str) -> Vec<IP6Net
     };
     let mut cidrs = Vec::new();
     for part in raw.split(',') {
-        match parse_ip6net_keep_host(part) {
+        match parse_ip6net(part) {
             Some(net) => cidrs.push(net),
             None => {
                 tracing::error!(

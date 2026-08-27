@@ -141,7 +141,7 @@ pub(crate) async fn run_node_informer(ictx: InformerCtx) {
 
         let items = list.items;
         let old = ictx.store.replace_all(items.clone());
-        reconcile_relist(&ictx, &old, &items);
+        reconcile_relist(&ictx, &old, &items).await;
         ictx.store.mark_synced();
 
         // WATCH from the list's resourceVersion until it ends.
@@ -166,19 +166,19 @@ pub(crate) async fn run_node_informer(ictx: InformerCtx) {
 
 /// Deltas of a LIST replace (Go DeltaFIFO Replace): objects in the new
 /// list are Added (new) or Updated (known); missing ones are Deleted.
-fn reconcile_relist(ictx: &InformerCtx, old: &HashMap<String, Node>, items: &[Node]) {
+async fn reconcile_relist(ictx: &InformerCtx, old: &HashMap<String, Node>, items: &[Node]) {
     let h = ictx.handler_ctx();
     let mut seen: HashSet<&str> = HashSet::new();
     for node in items {
         seen.insert(node.metadata.name.as_str());
         match old.get(&node.metadata.name) {
-            None => handle_add_lease_event(&h, EventType::Added, node),
-            Some(prev) => handle_update_lease_event(&h, prev, node),
+            None => handle_add_lease_event(&h, EventType::Added, node).await,
+            Some(prev) => handle_update_lease_event(&h, prev, node).await,
         }
     }
     for (name, node) in old {
         if !seen.contains(name.as_str()) {
-            handle_add_lease_event(&h, EventType::Removed, node);
+            handle_add_lease_event(&h, EventType::Removed, node).await;
         }
     }
 }
@@ -219,7 +219,7 @@ async fn run_watch(ictx: &InformerCtx, rv: &mut Option<String>) -> WatchEnd {
                         if let Some(new_rv) = &event.object.metadata.resource_version {
                             *rv = Some(new_rv.clone());
                         }
-                        dispatch(ictx, event);
+                        dispatch(ictx, event).await;
                     }
                     Err(KubeError::Gone) => return WatchEnd::Gone,
                     Err(e) => return WatchEnd::Failed(e),
@@ -229,7 +229,7 @@ async fn run_watch(ictx: &InformerCtx, rv: &mut Option<String>) -> WatchEnd {
                 // Go ResyncPeriod: re-emit MODIFIED for all stored nodes.
                 let h = ictx.handler_ctx();
                 for node in ictx.store.snapshot() {
-                    handle_update_lease_event(&h, &node.clone(), &node);
+                    handle_update_lease_event(&h, &node.clone(), &node).await;
                 }
             }
         }
@@ -238,12 +238,14 @@ async fn run_watch(ictx: &InformerCtx, rv: &mut Option<String>) -> WatchEnd {
 
 /// Route one watch frame to the store and the lease event handlers with
 /// client-go informer semantics (ADDED of a known object is an update).
-fn dispatch(ictx: &InformerCtx, event: WatchEvent<Node>) {
+/// Awaiting the handlers is the Go backpressure: a full events channel
+/// (all retry slots busy) blocks the informer loop instead of dropping.
+async fn dispatch(ictx: &InformerCtx, event: WatchEvent<Node>) {
     let h = ictx.handler_ctx();
     match event.event_type {
         WatchEventType::Added => match ictx.store.put(event.object.clone()) {
-            None => handle_add_lease_event(&h, EventType::Added, &event.object),
-            Some(old) => handle_update_lease_event(&h, &old, &event.object),
+            None => handle_add_lease_event(&h, EventType::Added, &event.object).await,
+            Some(old) => handle_update_lease_event(&h, &old, &event.object).await,
         },
         WatchEventType::Modified | WatchEventType::Bookmark => {
             // Bookmark carries only a fresh resourceVersion (already
@@ -255,13 +257,13 @@ fn dispatch(ictx: &InformerCtx, event: WatchEvent<Node>) {
                 .store
                 .put(event.object.clone())
                 .unwrap_or_else(|| event.object.clone());
-            handle_update_lease_event(&h, &old, &event.object);
+            handle_update_lease_event(&h, &old, &event.object).await;
         }
         WatchEventType::Deleted => {
             // Go DeleteFunc: DeletedFinalStateUnknown handling collapses
             // to "always treat the payload as the deleted node" here.
             ictx.store.remove(&event.object.metadata.name);
-            handle_add_lease_event(&h, EventType::Removed, &event.object);
+            handle_add_lease_event(&h, EventType::Removed, &event.object).await;
         }
         WatchEventType::Error => {
             // Surfaced as Err by the watch decoder; ignore defensively.

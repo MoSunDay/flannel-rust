@@ -31,7 +31,7 @@ pub(crate) struct EventEnv<'a> {
 }
 
 /// Go: `handleAddLeaseEvent(ctx, et, obj)`.
-pub(crate) fn handle_add_lease_event(env: &EventEnv<'_>, et: EventType, node: &Node) {
+pub(crate) async fn handle_add_lease_event(env: &EventEnv<'_>, et: EventType, node: &Node) {
     let ann = &node.metadata.annotations;
     if annotation(ann, &env.annotations.subnet_kube_managed) != "true" {
         return;
@@ -52,13 +52,14 @@ pub(crate) fn handle_add_lease_event(env: &EventEnv<'_>, et: EventType, node: &N
             lease,
         },
         &node.metadata.name,
-    );
+    )
+    .await;
 }
 
 /// Go: `handleUpdateLeaseEvent(ctx, oldObj, newObj)`: verifies anything
 /// relevant changed (backend-data, backend-type, public-ip per family).
 /// Ported exactly, including Go's sequential `changed` overwrites.
-pub(crate) fn handle_update_lease_event(env: &EventEnv<'_>, old: &Node, new: &Node) {
+pub(crate) async fn handle_update_lease_event(env: &EventEnv<'_>, old: &Node, new: &Node) {
     let o = &old.metadata.annotations;
     let n = &new.metadata.annotations;
     if annotation(n, &env.annotations.subnet_kube_managed) != "true" {
@@ -107,17 +108,22 @@ pub(crate) fn handle_update_lease_event(env: &EventEnv<'_>, old: &Node, new: &No
             lease,
         },
         &new.metadata.name,
-    );
+    )
+    .await;
 }
 
 /// Go: `enqueueLeaseEvent(ctx, evt, nodeName)`. Try a non-blocking send;
 /// when the channel is full, retry asynchronously with exponential
 /// backoff (100ms doubling to 5s) bounded by a 100-slot semaphore.
 ///
+/// Like Go's `asyncSendSemaphore.Acquire(ctx, 1)`, acquiring a retry
+/// slot BLOCKS until one frees or `ctx` is done: when all 100 slots are
+/// busy the informer handler waits instead of dropping the event.
+///
 /// Adaptation: Go's retry goroutine creates a ticker but its select has
 /// no ticker.C case, i.e. it busy-spins; this port actually sleeps the
 /// backoff duration instead (same bounds, no CPU burn).
-pub(crate) fn enqueue_lease_event(
+pub(crate) async fn enqueue_lease_event(
     ctx: &CancellationToken,
     tx: &mpsc::Sender<Event>,
     sem: &Arc<Semaphore>,
@@ -135,10 +141,24 @@ pub(crate) fn enqueue_lease_event(
         }
     }
 
-    // Instead of a non-blocking retry, *block* until a slot is free.
-    let Ok(permit) = sem.clone().try_acquire_owned() else {
-        tracing::error!("error in acquiring semaphore for async event send, dropping event");
-        return;
+    // Block until a retry slot is free or the context is done.
+    let permit = tokio::select! {
+        biased;
+        _ = ctx.cancelled() => {
+            tracing::error!(
+                "Context cancelled while acquiring semaphore for node {node_name:?}"
+            );
+            return;
+        }
+        acquired = sem.clone().acquire_owned() => match acquired {
+            Ok(permit) => permit,
+            Err(e) => {
+                tracing::error!(
+                    "error in acquiring semaphore for async event send, dropping event: {e}"
+                );
+                return;
+            }
+        },
     };
 
     let ctx = ctx.clone();

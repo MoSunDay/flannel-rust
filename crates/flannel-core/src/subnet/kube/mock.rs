@@ -26,8 +26,12 @@ struct MockState {
     frames: Vec<(u64, String)>,
     /// Live watch connections.
     watchers: Vec<WatchTx>,
-    /// Recorded PATCH requests: (content-type, body, node name).
+    /// Recorded PATCH requests to the main resource:
+    /// (content-type, node name, body).
     patches: Vec<(String, String, Value)>,
+    /// Recorded PATCH requests to the /status subresource
+    /// (content-type, node name, body).
+    status_patches: Vec<(String, String, Value)>,
     /// Pods: (namespace, name) -> nodeName.
     pods: HashMap<(String, String), String>,
     /// Next N watch requests get 410 Gone (relist exercise).
@@ -48,6 +52,10 @@ impl MockApiserver {
         let app = Router::new()
             .route("/api/v1/nodes", get(list_or_watch_nodes))
             .route("/api/v1/nodes/{name}", get(get_node).patch(patch_node))
+            .route(
+                "/api/v1/nodes/{name}/status",
+                get(get_node).patch(patch_node_status),
+            )
             .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
             .with_state(api.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -132,6 +140,11 @@ impl MockApiserver {
         self.state.lock().unwrap().patches.clone()
     }
 
+    /// Recorded /status-subresource patches: (content-type, node, body).
+    pub(crate) fn status_patches(&self) -> Vec<(String, String, Value)> {
+        self.state.lock().unwrap().status_patches.clone()
+    }
+
     pub(crate) fn node_status(&self, name: &str) -> Option<Value> {
         self.state
             .lock()
@@ -212,6 +225,34 @@ async fn patch_node(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    apply_patch(api, name, headers, body, Target::Main).await
+}
+
+/// PATCH `/nodes/{name}/status` (Go `PatchStatus`): recorded separately
+/// so tests can prove status writes take the subresource endpoint.
+async fn patch_node_status(
+    State(api): State<MockApiserver>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    apply_patch(api, name, headers, body, Target::Status).await
+}
+
+/// Which endpoint a patch was recorded on.
+#[derive(Clone, Copy, PartialEq)]
+enum Target {
+    Main,
+    Status,
+}
+
+async fn apply_patch(
+    api: MockApiserver,
+    name: String,
+    headers: HeaderMap,
+    body: Bytes,
+    target: Target,
+) -> Response {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -226,7 +267,12 @@ async fn patch_node(
     let Some(mut node) = st.nodes.get(&name).cloned() else {
         return not_found(&format!("nodes \"{name}\""));
     };
-    st.patches.push((content_type, name.clone(), patch.clone()));
+    match target {
+        Target::Main => st.patches.push((content_type, name.clone(), patch.clone())),
+        Target::Status => st
+            .status_patches
+            .push((content_type, name.clone(), patch.clone())),
+    }
 
     if let Some(ann) = patch
         .pointer("/metadata/annotations")

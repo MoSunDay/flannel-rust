@@ -36,14 +36,17 @@ fn round_trip_with_write_subnet_file() {
     };
     write_subnet_file(&path_str, &config, true, sn, v6sn, 1450).unwrap();
 
-    // write_subnet_file increments the lease IP by one (first usable).
+    // write_subnet_file increments the lease IP by one (first usable);
+    // the readers mask host bits like Go net.ParseCIDR, so the lease
+    // address reads back as the NETWORK (Go main.go prev-subnet
+    // comparisons and masq recycle are network-to-network).
     assert_eq!(
         read_cidr_from_subnet_file(&path_str, "FLANNEL_NETWORK").to_string(),
         "10.244.0.0/16"
     );
     assert_eq!(
         read_cidr_from_subnet_file(&path_str, "FLANNEL_SUBNET").to_string(),
-        "10.244.1.1/24"
+        "10.244.1.0/24"
     );
     assert_eq!(
         read_ip6_cidr_from_subnet_file(&path_str, "FLANNEL_IPV6_NETWORK").to_string(),
@@ -51,7 +54,38 @@ fn round_trip_with_write_subnet_file() {
     );
     assert_eq!(
         read_ip6_cidr_from_subnet_file(&path_str, "FLANNEL_IPV6_SUBNET").to_string(),
-        "fc00::1:1/64"
+        "fc00::/64"
+    );
+}
+
+/// Go `net.ParseCIDR`: host bits are masked, not rejected (`10.244.1.1/24`
+/// parses to `10.244.1.0/24`), for both families.
+#[test]
+fn cidr_parses_mask_host_bits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("subnet.env");
+    let path_str = path.display().to_string();
+    write(
+        &path_str,
+        "FLANNEL_SUBNET=10.244.1.1/24
+",
+    );
+
+    assert_eq!(
+        read_cidr_from_subnet_file(&path_str, "FLANNEL_SUBNET").to_string(),
+        "10.244.1.0/24"
+    );
+
+    let path6 = dir.path().join("subnet6.env");
+    let path6_str = path6.display().to_string();
+    write(
+        &path6_str,
+        "FLANNEL_IPV6_SUBNET=fc00::1:1/64
+",
+    );
+    assert_eq!(
+        read_ip6_cidr_from_subnet_file(&path6_str, "FLANNEL_IPV6_SUBNET").to_string(),
+        "fc00::/64"
     );
 }
 
@@ -84,8 +118,8 @@ fn multi_value_entries_comma_split() {
 
     let cidrs = read_cidrs_from_subnet_file(&path_str, "FLANNEL_SUBNET");
     assert_eq!(cidrs.len(), 2);
-    assert_eq!(cidrs[0].to_string(), "10.244.1.1/24");
-    assert_eq!(cidrs[1].to_string(), "10.244.2.1/24");
+    assert_eq!(cidrs[0].to_string(), "10.244.1.0/24");
+    assert_eq!(cidrs[1].to_string(), "10.244.2.0/24");
 
     // Go's single-value reader returns the zero net when >1 entry.
     assert_eq!(

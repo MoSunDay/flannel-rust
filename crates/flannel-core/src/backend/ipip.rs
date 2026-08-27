@@ -70,6 +70,17 @@ pub fn expected_tunnel_mtu(ext_mtu: u32, iface_name: &str) -> anyhow::Result<u32
     Ok(ext_mtu - 20)
 }
 
+/// Whether the tunnel MTU is rewritten to `expect_mtu`. Go upstream
+/// (ipip.go `configureIPIPDevice`) only LOWERS: `oldMTU > expectMTU ||
+/// oldMTU == 0`. Consequences (intentional, upstream behavior):
+/// - iface MTU raised to jumbo: the existing tunnel keeps its (smaller)
+///   MTU — a restart on a fresh device picks the new size;
+/// - an operator-shrunk tunnel MTU is kept, not "fixed" upward.
+/// - a missing MTU attribute (0) is always populated.
+pub fn should_apply_mtu(old_mtu: u32, expect_mtu: u32) -> bool {
+    old_mtu > expect_mtu || old_mtu == 0
+}
+
 /// Port of the Go `GetRoute` closure: route via the tunnel device with
 /// FLAG_ONLINK (no gateway resolution needed on a point-to-point-style
 /// tunnel); with DirectRouting enabled, L2-adjacent peers are routed
@@ -288,7 +299,7 @@ async fn configure_ipip_device(
         &ei.iface_name,
     )?;
     let mut mtu = old_mtu;
-    if old_mtu > expect_mtu || old_mtu == 0 {
+    if should_apply_mtu(old_mtu, expect_mtu) {
         tracing::info!("current MTU of {TUNNEL_NAME} is {old_mtu}, setting it to {expect_mtu}");
         let set = LinkUnspec::new_with_index(link_index)
             .mtu(expect_mtu)
