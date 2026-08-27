@@ -15,9 +15,9 @@
 //!
 //! Top-level deviations from Go (all documented at the use site):
 //! - Go's single-consumer `events` channel is kept internally but fanned
-//!   out over an [`EventHub`] (bounded backlog + replay on subscribe) so
-//!   `watch_leases` and the here-implemented `watch_lease` can run
-//!   independently.
+//!   out over an [`EventHub`] (bounded backlog + replay on subscribe,
+//!   blocking backpressure per subscriber) so `watch_leases` and the
+//!   here-implemented `watch_lease` can run independently.
 //! - On informer sync failure Go returns the manager together with the
 //!   error; this constructor returns only the error.
 
@@ -28,6 +28,9 @@ mod informer;
 mod status;
 mod watch_ops;
 
+#[cfg(test)]
+#[path = "hub_tests.rs"]
+mod hub_tests;
 #[cfg(test)]
 #[path = "kube_integration_tests.rs"]
 mod kube_integration_tests;
@@ -226,9 +229,11 @@ fn new_kube_subnet_manager(
 }
 
 /// Bridges the Go-style single event channel to the watcher fan-out.
+/// `publish` awaits its subscribers: a slow watcher backpressures the
+/// informer exactly like Go's single consumer does.
 async fn fan_out(mut rx: mpsc::Receiver<Event>, hub: EventHub) {
     while let Some(event) = rx.recv().await {
-        hub.publish(event);
+        hub.publish(event).await;
     }
 }
 
@@ -257,17 +262,38 @@ impl EventHub {
         }
     }
 
-    fn publish(&self, event: Event) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.backlog.push_back(event.clone());
-        while inner.backlog.len() > inner.capacity {
-            inner.backlog.pop_front();
+    /// Blocking backpressure, Go's single-consumer semantics spread over
+    /// the subscribers: each subscriber is awaited (`send().await`) so a
+    /// watcher that cannot keep up slows the informer instead of being
+    /// silently evicted (the old `try_send` + `retain` dropped a stalled
+    /// watcher's channel permanently and the watch chain stopped while
+    /// the daemon kept running). Only `Closed` receivers — a watcher
+    /// returned/dropped — retire their sender. Subscribers are served in
+    /// registration order, so one stalled watcher delays the others
+    /// (there is no per-subscriber buffer beyond the channel capacity).
+    /// The lock is never held across `.await`.
+    async fn publish(&self, event: Event) {
+        let subscribers: Vec<mpsc::Sender<Event>> = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.backlog.push_back(event.clone());
+            while inner.backlog.len() > inner.capacity {
+                inner.backlog.pop_front();
+            }
+            inner.subscribers.clone()
+        };
+
+        let mut retired: Vec<mpsc::Sender<Event>> = Vec::new();
+        for tx in &subscribers {
+            if tx.send(event.clone()).await.is_err() {
+                retired.push(tx.clone());
+            }
         }
-        // Drop events only for subscribers that cannot keep up (Go's
-        // single consumer instead backpressured the informer).
-        inner
-            .subscribers
-            .retain(|tx| tx.try_send(event.clone()).is_ok());
+        if !retired.is_empty() {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .subscribers
+                .retain(|tx| !retired.iter().any(|r| r.same_channel(tx)));
+        }
     }
 
     fn subscribe(&self) -> mpsc::Receiver<Event> {

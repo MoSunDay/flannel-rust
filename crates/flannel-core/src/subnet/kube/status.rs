@@ -5,10 +5,6 @@
 //! - Go's `clusterCIDRController` branch (ClusterCIDR resources) is not
 //!   ported: the Rust port has no ClusterCIDR informer, so the branch is
 //!   always nil and skipped.
-//! - Go calls `PatchStatus` (the `/status` subresource). The thin Rust
-//!   [`crate::kube::KubeClient`] has no subresource method, so the same
-//!   strategic-merge patch is applied to the main node resource; the
-//!   apiserver accepts it there too for `status.conditions`.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,8 +37,11 @@ pub(crate) async fn complete_lease(
         "lastHeartbeatTime": now,
     }]);
     let patch = json!({ "status": { "conditions": conditions } });
+    // Go: `PatchStatus` — status.conditions are only accepted on the
+    // /status subresource; the main endpoint ignores them (node would
+    // stay NotReady).
     mgr.client
-        .patch_node(&mgr.node_name, &patch, PatchType::StrategicMerge)
+        .patch_node_status(&mgr.node_name, &patch, PatchType::StrategicMerge)
         .await?;
     Ok(())
 }

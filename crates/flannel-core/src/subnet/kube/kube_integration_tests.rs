@@ -191,8 +191,20 @@ async fn complete_lease_patches_node_status_condition() {
     assert_eq!(cond["status"], "False");
     assert_eq!(cond["reason"], "FlannelIsUp");
     assert_eq!(cond["message"], "Flannel is running on this node");
-    let (ct, _, _) = &api.patches()[0];
+    // Go PatchStatus: the write must land on the /status subresource,
+    // not the main node resource (the apiserver ignores conditions
+    // there and the node would stay NotReady).
+    assert!(
+        api.patches().is_empty(),
+        "status must not be patched via the main node resource"
+    );
+    let (ct, node, body) = &api.status_patches()[0];
     assert_eq!(ct, "application/strategic-merge-patch+json");
+    assert_eq!(node, "node1");
+    assert!(body
+        .get("status")
+        .and_then(|s| s.get("conditions"))
+        .is_some());
 }
 
 #[tokio::test]
@@ -208,6 +220,7 @@ async fn complete_lease_skips_when_flag_disabled() {
 
     mgr.complete_lease(&cancel, &dummy_lease()).await.unwrap();
     assert!(api.patches().is_empty());
+    assert!(api.status_patches().is_empty());
 }
 
 #[tokio::test]

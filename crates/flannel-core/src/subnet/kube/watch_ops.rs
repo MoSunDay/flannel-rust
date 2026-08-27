@@ -4,8 +4,10 @@
 //!
 //! Deviations from Go (documented):
 //! - Go's `events` channel has one consumer; here the informer feeds an
-//!   [`EventHub`] fan-out (bounded backlog + replay on subscribe) so
-//!   `watch_leases` and `watch_lease` can run independently.
+//!   [`EventHub`] fan-out (bounded backlog + replay on subscribe,
+//!   blocking backpressure: a stalled watcher slows the informer instead
+//!   of losing its subscription) so `watch_leases` and `watch_lease` can
+//!   run independently.
 //! - Go's `WatchLease` returns `ErrUnimplemented`; this port implements
 //!   it as a filter for the single subnet (sn, sn6).
 

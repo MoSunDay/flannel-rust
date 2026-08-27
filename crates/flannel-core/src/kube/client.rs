@@ -114,7 +114,28 @@ impl KubeClient {
         patch: &Value,
         patch_type: PatchType,
     ) -> Result<Node, KubeError> {
-        let url = self.endpoint(&format!("/api/v1/nodes/{name}"))?;
+        self.patch_node_at(name, "", patch, patch_type).await
+    }
+
+    /// PATCH the `status` subresource (Go: `Nodes().PatchStatus`): the
+    /// only endpoint on which `status.conditions` writes are accepted.
+    pub async fn patch_node_status(
+        &self,
+        name: &str,
+        patch: &Value,
+        patch_type: PatchType,
+    ) -> Result<Node, KubeError> {
+        self.patch_node_at(name, "/status", patch, patch_type).await
+    }
+
+    async fn patch_node_at(
+        &self,
+        name: &str,
+        subresource: &str,
+        patch: &Value,
+        patch_type: PatchType,
+    ) -> Result<Node, KubeError> {
+        let url = self.endpoint(&format!("/api/v1/nodes/{name}{subresource}"))?;
         let body = serde_json::to_vec(patch)
             .map_err(|e| KubeError::Decode(format!("serializing patch: {e}")))?;
         let req = self

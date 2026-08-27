@@ -155,3 +155,32 @@ async fn get_route_builds_onlink_tunnel_route() {
     assert!(spec.onlink); // Go FLAG_ONLINK
     assert_eq!(spec.family, AddressFamily::Inet);
 }
+
+/// Go only LOWERS the tunnel MTU (`oldMTU > expectMTU || oldMTU == 0`).
+/// Pins the jumbo (iface MTU raised -> tunnel keeps its size) and
+/// operator-shrunk (smaller MTU kept) scenarios as documented upstream
+/// behavior; a missing attribute (0) is always populated.
+#[test]
+fn should_apply_mtu_only_lowers_like_go() {
+    // Normal: iface 1500 -> tunnel expect 1480, existing 1500 -> set.
+    assert!(super::should_apply_mtu(1500, 1480));
+    // Stale larger tunnel (e.g. iface was shrunk 1500 -> 1400): lowered.
+    assert!(super::should_apply_mtu(1500 - 20, 1400 - 20));
+    // Jumbo: iface raised 1500 -> 9000, tunnel keeps 1480 (no raise).
+    assert!(!super::should_apply_mtu(1480, 9000 - 20));
+    // Operator manually shrank the tunnel: kept, not raised back.
+    assert!(!super::should_apply_mtu(1000, 1480));
+    // Equal: no-op.
+    assert!(!super::should_apply_mtu(1480, 1480));
+    // Missing MTU attribute: populated.
+    assert!(super::should_apply_mtu(0, 1480));
+}
+
+/// Go `expectMTU = extIface.Iface.MTU - 20` with the too-small guard.
+#[test]
+fn expected_tunnel_mtu_subtracts_encap_and_guards() {
+    assert_eq!(super::expected_tunnel_mtu(1500, "eth0").unwrap(), 1480);
+    assert_eq!(super::expected_tunnel_mtu(9000, "eth0").unwrap(), 8980);
+    let err = super::expected_tunnel_mtu(20, "eth0").unwrap_err();
+    assert!(err.to_string().contains("too small for ipip mode"));
+}
