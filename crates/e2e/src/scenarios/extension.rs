@@ -98,15 +98,9 @@ async fn run() -> Result<(), E2EError> {
     // string, i.e. the peer's PreStartupCommand stdout).
     let peer_annotations: BTreeMap<String, Value> = BTreeMap::from([
         (format!("{PREFIX}/backend-type"), json!("extension")),
-        (
-            format!("{PREFIX}/backend-data"),
-            json!("\"peer-marker\""),
-        ),
+        (format!("{PREFIX}/backend-data"), json!("\"peer-marker\"")),
         (format!("{PREFIX}/public-ip"), json!("10.99.0.3")),
-        (
-            format!("{PREFIX}/kube-subnet-manager"),
-            json!("true"),
-        ),
+        (format!("{PREFIX}/kube-subnet-manager"), json!("true")),
     ]);
     api.patch_node_annotations("e2e-peer", &peer_annotations)
         .await?;
