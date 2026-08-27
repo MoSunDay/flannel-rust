@@ -60,6 +60,11 @@ impl MockApiserver {
                 "/api/v1/nodes/{name}",
                 get(get_node).patch(patch_node).delete(delete_node),
             )
+            .route(
+                // Go PatchStatus: status.conditions writes land here.
+                "/api/v1/nodes/{name}/status",
+                get(get_node).patch(patch_node_status),
+            )
             .with_state(state.clone());
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -261,6 +266,26 @@ async fn patch_node(
     headers: HeaderMap,
     State(st): State<Arc<Mutex<MockState>>>,
     body: Bytes, // body-consuming extractors must come last
+) -> Response {
+    apply_patch(name, headers, st, body).await
+}
+
+/// PATCH `/nodes/{name}/status` (Go `PatchStatus`): recorded in the same
+/// patch log so scenarios can assert the daemon took the subresource.
+async fn patch_node_status(
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    State(st): State<Arc<Mutex<MockState>>>,
+    body: Bytes,
+) -> Response {
+    apply_patch(name, headers, st, body).await
+}
+
+async fn apply_patch(
+    name: String,
+    headers: HeaderMap,
+    st: Arc<Mutex<MockState>>,
+    body: Bytes,
 ) -> Response {
     let content_type = headers
         .get("content-type")

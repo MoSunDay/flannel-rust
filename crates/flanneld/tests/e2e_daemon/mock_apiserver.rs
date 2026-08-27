@@ -35,6 +35,11 @@ impl MockApiserver {
         let app = Router::new()
             .route("/api/v1/nodes", get(list_or_watch_nodes))
             .route("/api/v1/nodes/{name}", get(get_node).patch(patch_node))
+            .route(
+                // Go PatchStatus: status.conditions writes land here.
+                "/api/v1/nodes/{name}/status",
+                get(get_node).patch(patch_node),
+            )
             .with_state(api.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
