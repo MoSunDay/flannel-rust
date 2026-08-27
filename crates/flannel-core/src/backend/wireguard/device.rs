@@ -129,17 +129,26 @@ pub struct WGDevice {
     pub ifname: String,
 }
 
-/// Go: `writePrivateKey` (MkdirAll dir 0755, chmod the file 0400).
+/// Go: `writePrivateKey` (MkdirAll dir 0755, file mode 0400). The key
+/// file is created with mode 0400 in a single step so no world/plaintext
+/// readable 0644 copy ever exists (write-then-chmod leaks the key to a
+/// concurrent reader in that window).
 fn write_private_key(path: &str, content: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = std::path::Path::new(path)
         .parent()
         .unwrap_or(std::path::Path::new(""));
     if !dir.as_os_str().is_empty() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, content)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o400)
+        .open(path)?
+        .write_all(content.as_bytes())?;
     Ok(())
 }
 /// Go: `(*wgDeviceAttrs).setupKeys`: load or generate the node key
@@ -397,4 +406,23 @@ pub async fn remove_peer(dev: &WGDevice, peer_public_key_raw: &str) -> anyhow::R
         .await
         .map_err(|e| anyhow!("failed to remove peer: {e}"))?
         .map_err(|e| anyhow!("failed to remove peer {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The key file is created with mode 0400 in ONE step: no 0644
+    /// plaintext window between create and chmod.
+    #[test]
+    fn private_key_file_created_with_0400() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("wgkey");
+        write_private_key(&path.display().to_string(), "secret-key").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o400);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret-key");
+    }
 }

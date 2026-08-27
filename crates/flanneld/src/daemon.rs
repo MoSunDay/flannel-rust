@@ -268,8 +268,10 @@ pub async fn run(mut opts: Options, cancel: CancellationToken) -> anyhow::Result
 
     if let Err(e) = sm.complete_lease(&cancel, bn.lease()).await {
         tracing::error!("CompleteLease execute error err: {e}");
-        if e.to_string().eq_ignore_ascii_case("interrupted") {
-            // The lease was "revoked" - shut everything down.
+        // Go: strings.EqualFold(err.Error(), errInterrupted.Error()) —
+        // the lease was "revoked"; downcast the typed sentinel instead
+        // of comparing error strings.
+        if e.is::<flannel_core::subnet::Interrupted>() {
             cancel.cancel();
         }
     }

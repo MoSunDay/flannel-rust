@@ -10,6 +10,14 @@ pub mod writefile;
 #[path = "config_tests.rs"]
 mod config_tests;
 
+/// Go main.go `errInterrupted` ("interrupted"; the etcd local manager
+/// returns it when the node's lease is revoked). Typed instead of a
+/// string sentinel so callers downcast (`err.is::<Interrupted>()`)
+/// rather than compare error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("interrupted")]
+pub struct Interrupted;
+
 pub use config::{check_network_config, parse_config, Config, ConfigError};
 pub use kube::{new_subnet_manager, KubeSubnetManager};
 pub use manager::{Ctx, Manager};

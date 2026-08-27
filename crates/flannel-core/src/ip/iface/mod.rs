@@ -62,18 +62,21 @@ pub(crate) fn nlerr(e: rtnetlink::Error) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-/// Address of an address message: `IFA_ADDRESS`, falling back to
-/// `IFA_LOCAL` (point-to-point links carry the local address only).
+/// Address of an address message: `IFA_LOCAL` preferred, falling back
+/// to `IFA_ADDRESS`. On point-to-point links `IFA_ADDRESS` carries the
+/// peer address while `IFA_LOCAL` carries the interface's own address;
+/// the local one is what flannel must use (Go `netlink.AddrList` returns
+/// `IFA_LOCAL` when present, else `IFA_ADDRESS`).
 pub(crate) fn addr_ip(msg: &AddressMessage) -> Option<IpAddr> {
-    let mut local = None;
+    let mut address = None;
     for attr in &msg.attributes {
         match attr {
-            AddressAttribute::Address(ip) => return Some(*ip),
-            AddressAttribute::Local(ip) => local = Some(*ip),
+            AddressAttribute::Local(ip) => return Some(*ip),
+            AddressAttribute::Address(ip) => address = Some(*ip),
             _ => {}
         }
     }
-    local
+    address
 }
 
 /// Name of a link message (`?` placeholder when the attribute is

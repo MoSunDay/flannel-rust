@@ -196,7 +196,7 @@ async fn wait_for_node_with_cidrs(mgr: &KubeSubnetManager, ctx: Ctx<'_>) -> anyh
         }
         if ctx.is_cancelled() {
             anyhow::bail!(
-                "timeout contacting kube-api, failed to patch node \"{}\". \
+                "timeout contacting kube-api, failed to get node \"{}\". \
                  Error: context canceled",
                 mgr.node_name
             );
@@ -204,7 +204,7 @@ async fn wait_for_node_with_cidrs(mgr: &KubeSubnetManager, ctx: Ctx<'_>) -> anyh
         let now = Instant::now();
         if now >= deadline {
             anyhow::bail!(
-                "timeout contacting kube-api, failed to patch node \"{}\". \
+                "timeout contacting kube-api, failed to get node \"{}\". \
                  Error: context deadline exceeded",
                 mgr.node_name
             );
@@ -212,7 +212,7 @@ async fn wait_for_node_with_cidrs(mgr: &KubeSubnetManager, ctx: Ctx<'_>) -> anyh
         let sleep = POLL_INTERVAL.min(deadline - now);
         if !sleep_cancellable(sleep, ctx).await {
             anyhow::bail!(
-                "timeout contacting kube-api, failed to patch node \"{}\". \
+                "timeout contacting kube-api, failed to get node \"{}\". \
                  Error: context canceled",
                 mgr.node_name
             );
@@ -317,7 +317,9 @@ async fn maybe_patch_annotations(
 }
 
 /// Go's second `wait.PollUntilContextTimeout` around the PATCH call:
-/// retry every 3s up to 30s on any error; identical error string.
+/// retry every 3s up to 30s on any error; identical error string
+/// ("failed to patch node" — distinct from the node-wait phase above so
+/// a timeout names the operation that actually timed out).
 async fn patch_with_retry(
     mgr: &KubeSubnetManager,
     ctx: Ctx<'_>,
