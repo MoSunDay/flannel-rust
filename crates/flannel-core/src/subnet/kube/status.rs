@@ -18,7 +18,7 @@ use super::KubeSubnetManager;
 /// Go: `CompleteLease` — clears NodeNetworkUnavailable once flannel runs.
 pub(crate) async fn complete_lease(
     mgr: &KubeSubnetManager,
-    _ctx: Ctx<'_>,
+    ctx: Ctx<'_>,
     _lease: &crate::lease::Lease,
 ) -> anyhow::Result<()> {
     // Go: clusterCIDRController startup/sync wait — not ported (always
@@ -41,7 +41,7 @@ pub(crate) async fn complete_lease(
     // /status subresource; the main endpoint ignores them (node would
     // stay NotReady).
     mgr.client
-        .patch_node_status(&mgr.node_name, &patch, PatchType::StrategicMerge)
+        .patch_node_status(ctx, &mgr.node_name, &patch, PatchType::StrategicMerge)
         .await?;
     Ok(())
 }

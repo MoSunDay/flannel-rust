@@ -111,7 +111,7 @@ fn raw_to_string(data: &Option<Box<serde_json::value::RawValue>>) -> String {
 /// is disabled (Go `disableNodeInformer`, backend type "alloc").
 async fn fetch_node(mgr: &KubeSubnetManager, ctx: Ctx<'_>) -> Option<Node> {
     if mgr.disable_node_informer {
-        match mgr.client.get_node(&mgr.node_name).await {
+        match mgr.client.get_node(ctx, &mgr.node_name).await {
             Ok(node) => return Some(node),
             Err(e) => {
                 tracing::debug!("Failed to get node {:?}: {e}", mgr.node_name);
@@ -329,7 +329,7 @@ async fn patch_with_retry(
     loop {
         match mgr
             .client
-            .patch_node(&mgr.node_name, patch, PatchType::StrategicMerge)
+            .patch_node(ctx, &mgr.node_name, patch, PatchType::StrategicMerge)
             .await
         {
             Ok(_) => return Ok(()),

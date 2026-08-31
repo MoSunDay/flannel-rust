@@ -31,6 +31,8 @@ pub enum KubeError {
     Config(String),
     #[error("decode error: {0}")]
     Decode(String),
+    #[error("operation canceled")]
+    Canceled,
 }
 
 /// Patch content types accepted by the apiserver.
@@ -93,51 +95,78 @@ impl KubeClient {
     }
 
     /// GET a pod (used for NODE_NAME discovery via pod.spec.nodeName).
-    pub async fn get_pod(&self, namespace: &str, name: &str) -> Result<Pod, KubeError> {
+    ///
+    /// Like client-go, every one-shot request is bound to the caller's
+    /// context: when `cancel` fires the in-flight request (connect *or*
+    /// response wait) is aborted with [`KubeError::Canceled`].
+    pub async fn get_pod(
+        &self,
+        cancel: &CancellationToken,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Pod, KubeError> {
         let url = self.endpoint(&format!("/api/v1/namespaces/{namespace}/pods/{name}"))?;
-        self.request_json(self.http.get(url), &format!("pod {namespace}/{name}"))
-            .await
+        self.request_json(
+            cancel,
+            self.http.get(url),
+            &format!("pod {namespace}/{name}"),
+        )
+        .await
     }
 
     /// GET a node; 404 maps to [`KubeError::NotFound`].
-    pub async fn get_node(&self, name: &str) -> Result<Node, KubeError> {
+    pub async fn get_node(
+        &self,
+        cancel: &CancellationToken,
+        name: &str,
+    ) -> Result<Node, KubeError> {
         let url = self.endpoint(&format!("/api/v1/nodes/{name}"))?;
-        self.request_json(self.http.get(url), &format!("node {name}"))
+        self.request_json(cancel, self.http.get(url), &format!("node {name}"))
             .await
     }
 
     /// LIST nodes, optionally filtered (e.g. `spec.nodeName=<node>`).
-    pub async fn list_nodes(&self, field_selector: Option<&str>) -> Result<NodeList, KubeError> {
+    pub async fn list_nodes(
+        &self,
+        cancel: &CancellationToken,
+        field_selector: Option<&str>,
+    ) -> Result<NodeList, KubeError> {
         let mut url = self.endpoint("/api/v1/nodes")?;
         if let Some(selector) = field_selector {
             url.query_pairs_mut().append_pair("fieldSelector", selector);
         }
-        self.request_json(self.http.get(url), "node list").await
+        self.request_json(cancel, self.http.get(url), "node list")
+            .await
     }
 
     /// PATCH a node's annotations/spec with the given patch document.
     pub async fn patch_node(
         &self,
+        cancel: &CancellationToken,
         name: &str,
         patch: &Value,
         patch_type: PatchType,
     ) -> Result<Node, KubeError> {
-        self.patch_node_at(name, "", patch, patch_type).await
+        self.patch_node_at(cancel, name, "", patch, patch_type)
+            .await
     }
 
     /// PATCH the `status` subresource (Go: `Nodes().PatchStatus`): the
     /// only endpoint on which `status.conditions` writes are accepted.
     pub async fn patch_node_status(
         &self,
+        cancel: &CancellationToken,
         name: &str,
         patch: &Value,
         patch_type: PatchType,
     ) -> Result<Node, KubeError> {
-        self.patch_node_at(name, "/status", patch, patch_type).await
+        self.patch_node_at(cancel, name, "/status", patch, patch_type)
+            .await
     }
 
     async fn patch_node_at(
         &self,
+        cancel: &CancellationToken,
         name: &str,
         subresource: &str,
         patch: &Value,
@@ -151,7 +180,8 @@ impl KubeClient {
             .patch(url)
             .header(CONTENT_TYPE, patch_type.content_type())
             .body(body);
-        self.request_json(req, &format!("node {name}")).await
+        self.request_json(cancel, req, &format!("node {name}"))
+            .await
     }
 
     /// WATCH nodes as a stream of typed events (boxed: `Unpin`, easy to
@@ -200,12 +230,22 @@ impl KubeClient {
 
     async fn request_json<T: DeserializeOwned>(
         &self,
+        cancel: &CancellationToken,
         req: reqwest::RequestBuilder,
         resource: &str,
     ) -> Result<T, KubeError> {
-        let resp = req.send().await?;
-        let status = resp.status();
-        let body = resp.text().await?;
+        // Go client-go binds the whole round trip to ctx: a canceled
+        // context aborts an in-flight dial *or* response wait instead of
+        // leaving run() parked on a dead apiserver. Mirror that here.
+        let (status, body) = tokio::select! {
+            _ = cancel.cancelled() => return Err(KubeError::Canceled),
+            r = async {
+                let resp = req.send().await?;
+                let status = resp.status();
+                let body = resp.text().await?;
+                Ok::<_, reqwest::Error>((status, body))
+            } => r.map_err(KubeError::Http)?,
+        };
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(KubeError::NotFound(resource.to_string()));
         }

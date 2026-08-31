@@ -128,7 +128,7 @@ pub(crate) async fn run_node_informer(ictx: InformerCtx) {
             return;
         }
         // LIST all nodes (Go: fields.Everything()).
-        let list = match ictx.client.list_nodes(None).await {
+        let list = match ictx.client.list_nodes(&ictx.cancel, None).await {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!("node list failed, retrying: {e}");
