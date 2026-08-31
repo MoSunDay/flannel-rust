@@ -157,8 +157,11 @@ pub async fn new_subnet_manager(
 }
 
 /// Go: NODE_NAME env, else POD_NAME/POD_NAMESPACE -> pod.Spec.NodeName.
-/// Error strings identical to Go.
+/// Error strings identical to Go. Runs in the constructor, before any
+/// context exists (Go uses context.TODO here) - a detached token matches
+/// that: the request is bounded by the dial timeout, not cancellable.
 async fn resolve_node_name(client: &KubeClient) -> anyhow::Result<String> {
+    let todo = tokio_util::sync::CancellationToken::new();
     let node_name = std::env::var("NODE_NAME").unwrap_or_default();
     if !node_name.is_empty() {
         return Ok(node_name);
@@ -169,7 +172,7 @@ async fn resolve_node_name(client: &KubeClient) -> anyhow::Result<String> {
         anyhow::bail!("env variables POD_NAME and POD_NAMESPACE must be set");
     }
     let pod = client
-        .get_pod(&pod_namespace, &pod_name)
+        .get_pod(&todo, &pod_namespace, &pod_name)
         .await
         .map_err(|e| {
             anyhow::anyhow!("error retrieving pod spec for '{pod_namespace}/{pod_name}': {e}")

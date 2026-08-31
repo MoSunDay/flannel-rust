@@ -3,7 +3,7 @@ Commit: 2f979c2
 
 ## 职责
 - 网络原语：`ip/`（IP4Net/IP6Net 算术、iface netlink、tun）、`lease/`（租约、MAC）、`mac.rs`、`utils.rs`、`endian.rs`
-- kube 客户端（`kube/`）：精简 HTTP apiserver 客户端，仅服务 kube-subnet-manager
+- kube 客户端（`kube/`）：精简 HTTP apiserver 客户端，仅服务 kube-subnet-manager；一次性请求首参 `&CancellationToken`，`request_json` 内 select 竞速取消（对齐 Go client-go ctx），watch 长轮询流式取消路径不变
 - subnet 层（`subnet/`）：`Manager` trait、`config` 解析、`writefile`（subnet.env）、`kube/` 管理器（informer/annotations/acquire/watch）
 - 后端（`backend/`）：`traits.rs`（Backend/Network，BoxFuture + CancellationToken ctx）、`manager.rs` 生命周期、`mod.rs` 注册表（9 个后端）、`route_network/` 共享路由缓存
 - 流量管理器（`trafficmngr/`）：iptables / nftables masq+forward 规则

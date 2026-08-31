@@ -170,11 +170,58 @@ fn client_for(url: &str) -> KubeClient {
     KubeClient::new(cfg).unwrap()
 }
 
+/// Server accepts the TCP connection but never answers: the request parks
+/// in the response-wait phase, past the dial. This is exactly what the e2e
+/// healthz flake hit (kernel dropped the PATCH handshake under load) - the
+/// in-flight round trip must unwind on token cancel instead of riding out
+/// the 30s connect timeout.
+#[tokio::test]
+async fn request_aborts_when_cancel_fires_mid_request() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            // Hold the connection open, never write.
+            tokio::spawn(async move {
+                let _sock = sock;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let client = client_for(&format!("http://{addr}"));
+    let cancel = CancellationToken::new();
+    let t = std::time::Instant::now();
+    let task = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { client.get_node(&cancel, "node1").await })
+    };
+    // Let the request reach the pending-response phase first.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    cancel.cancel();
+    let res = task.await.unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "cancellation must abort the in-flight request, took {:?}",
+        t.elapsed()
+    );
+    assert!(
+        matches!(res, Err(KubeError::Canceled)),
+        "expected Canceled, got: {res:?}"
+    );
+}
+
 #[tokio::test]
 async fn get_node_and_not_found() {
     let (url, _) = start_mock().await;
     let client = client_for(&url);
-    let node = client.get_node("node1").await.unwrap();
+    let node = client
+        .get_node(&tokio_util::sync::CancellationToken::new(), "node1")
+        .await
+        .unwrap();
     assert_eq!(node.metadata.name, "node1");
     assert_eq!(node.metadata.uid, "uid-node1");
     assert_eq!(node.spec.pod_cidr.as_deref(), Some("10.244.1.0/24"));
@@ -187,7 +234,10 @@ async fn get_node_and_not_found() {
         Some("true")
     );
 
-    match client.get_node("missing").await {
+    match client
+        .get_node(&tokio_util::sync::CancellationToken::new(), "missing")
+        .await
+    {
         Err(KubeError::NotFound(resource)) => assert!(resource.contains("missing")),
         other => panic!("expected NotFound, got {other:?}"),
     }
@@ -198,7 +248,11 @@ async fn get_pod_for_node_name_discovery() {
     let (url, _) = start_mock().await;
     let client = client_for(&url);
     let pod = client
-        .get_pod("kube-system", "kube-flannel-ds-abc")
+        .get_pod(
+            &tokio_util::sync::CancellationToken::new(),
+            "kube-system",
+            "kube-flannel-ds-abc",
+        )
         .await
         .unwrap();
     assert_eq!(pod.metadata.name, "kube-flannel-ds-abc");
@@ -210,7 +264,10 @@ async fn list_nodes_with_field_selector() {
     let (url, _) = start_mock().await;
     let client = client_for(&url);
     let list = client
-        .list_nodes(Some("spec.nodeName=node1"))
+        .list_nodes(
+            &tokio_util::sync::CancellationToken::new(),
+            Some("spec.nodeName=node1"),
+        )
         .await
         .unwrap();
     assert_eq!(list.items.len(), 1);
@@ -218,12 +275,18 @@ async fn list_nodes_with_field_selector() {
     assert_eq!(list.metadata.resource_version.as_deref(), Some("100"));
 
     let empty = client
-        .list_nodes(Some("spec.nodeName=other"))
+        .list_nodes(
+            &tokio_util::sync::CancellationToken::new(),
+            Some("spec.nodeName=other"),
+        )
         .await
         .unwrap();
     assert!(empty.items.is_empty());
 
-    let all = client.list_nodes(None).await.unwrap();
+    let all = client
+        .list_nodes(&tokio_util::sync::CancellationToken::new(), None)
+        .await
+        .unwrap();
     assert!(all.items.is_empty());
 }
 
@@ -234,7 +297,12 @@ async fn patch_node_content_type_and_body() {
     let patch =
         json!({"metadata": {"annotations": {"flannel.alpha.coreos.com/public-ip": "1.2.3.4"}}});
     let node = client
-        .patch_node("node1", &patch, PatchType::StrategicMerge)
+        .patch_node(
+            &tokio_util::sync::CancellationToken::new(),
+            "node1",
+            &patch,
+            PatchType::StrategicMerge,
+        )
         .await
         .unwrap();
     assert_eq!(node.metadata.name, "node1");
@@ -245,6 +313,7 @@ async fn patch_node_content_type_and_body() {
 
     client
         .patch_node(
+            &tokio_util::sync::CancellationToken::new(),
             "node1",
             &json!({"metadata": {"labels": {"a": "b"}}}),
             PatchType::Merge,
@@ -335,11 +404,17 @@ async fn bearer_token_is_forwarded() {
     let mut cfg = super::from_api_url(&url).unwrap();
     cfg.bearer_token = Some("test-token".to_string());
     let client = KubeClient::new(cfg).unwrap();
-    let node = client.get_node("secure").await.unwrap();
+    let node = client
+        .get_node(&tokio_util::sync::CancellationToken::new(), "secure")
+        .await
+        .unwrap();
     assert_eq!(node.metadata.name, "secure");
 
     let anonymous = client_for(&url);
-    match anonymous.get_node("secure").await {
+    match anonymous
+        .get_node(&tokio_util::sync::CancellationToken::new(), "secure")
+        .await
+    {
         Err(KubeError::Api(status)) => assert_eq!(status.code, 401),
         other => panic!("expected Api(401), got {other:?}"),
     }

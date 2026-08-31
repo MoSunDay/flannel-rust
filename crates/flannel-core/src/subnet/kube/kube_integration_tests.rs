@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::mock::MockApiserver;
+use super::new_kube_subnet_manager;
 use super::new_subnet_manager;
 use super::support::*;
 use crate::kube::{from_api_url, KubeClient};
@@ -205,6 +206,65 @@ async fn complete_lease_patches_node_status_condition() {
         .get("status")
         .and_then(|s| s.get("conditions"))
         .is_some());
+}
+
+/// The e2e healthz flake: daemon shutdown awaits CompleteLease, whose
+/// /status PATCH black-holed in the handshake phase, parking run() until
+/// the 30s client timeout - past the harness 15s shutdown window. Go is
+/// immune because client-go aborts in-flight requests on ctx cancel
+/// (kube.go PatchStatus). Pin that a cancelled token aborts the patch
+/// promptly; daemon.rs maps any error to exit code 0, so surfacing the
+/// cancellation as an error keeps Go exit-code parity.
+#[tokio::test]
+async fn complete_lease_aborts_when_cancel_fires_mid_patch() -> anyhow::Result<()> {
+    let _guard = ENV_LOCK.lock().await;
+    let _node = EnvGuard::set("NODE_NAME", "node1");
+    // Black-hole apiserver: accepts TCP, never answers. The PATCH hangs
+    // in the response-wait phase, not the dial phase.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let _sock = sock;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    // Build the manager directly: support::start() also boots the node
+    // informer and waits for its sync, which can never complete against a
+    // black-hole server. The flake mode under test is the status PATCH
+    // only, so skip the informer entirely.
+    let (_dir, conf) = write_conf(VXLAN_CONF);
+    let net_conf = std::fs::read_to_string(conf.to_str().unwrap()).unwrap();
+    let config = crate::subnet::config::parse_config(&net_conf).unwrap();
+    let client =
+        KubeClient::new(from_api_url(&format!("http://127.0.0.1:{port}")).unwrap()).unwrap();
+    let (mut sm, _events_rx) = new_kube_subnet_manager(client, config, "node1".into(), PREFIX)?;
+    sm.set_node_network_unavailable = true;
+    let mgr = std::sync::Arc::new(sm);
+    let cancel = CancellationToken::new();
+
+    let t = std::time::Instant::now();
+    let task = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { mgr.complete_lease(&cancel, &dummy_lease()).await })
+    };
+    // Let the PATCH reach the pending-response phase first.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    cancel.cancel();
+    let err = task.await.unwrap().unwrap_err();
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "cancellation must abort the in-flight patch, took {:?}",
+        t.elapsed()
+    );
+    assert!(err.to_string().contains("canceled"), "got: {err}");
+    Ok(())
 }
 
 #[tokio::test]

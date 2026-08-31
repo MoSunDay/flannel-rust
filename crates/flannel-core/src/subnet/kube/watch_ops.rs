@@ -115,9 +115,9 @@ pub(crate) async fn watch_lease(
 /// module-level deviation note.
 pub(crate) async fn get_stored_mac_addresses(
     mgr: &KubeSubnetManager,
-    _ctx: Ctx<'_>,
+    ctx: Ctx<'_>,
 ) -> (String, String) {
-    let node = match mgr.client.get_node(&mgr.node_name).await {
+    let node = match mgr.client.get_node(ctx, &mgr.node_name).await {
         Ok(node) => node,
         Err(e) => {
             tracing::error!("Failed to get node for backend data: {e}");
@@ -151,9 +151,9 @@ fn extract_mac(value: Option<&String>) -> String {
 /// normalized annotation keys (not the raw prefix ones).
 pub(crate) async fn get_stored_public_ip(
     mgr: &KubeSubnetManager,
-    _ctx: Ctx<'_>,
+    ctx: Ctx<'_>,
 ) -> (String, String) {
-    let node = match mgr.client.get_node(&mgr.node_name).await {
+    let node = match mgr.client.get_node(ctx, &mgr.node_name).await {
         Ok(node) => node,
         Err(e) => {
             tracing::error!("Failed to get node for backend data: {e}");
