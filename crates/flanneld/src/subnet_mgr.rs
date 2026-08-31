@@ -14,6 +14,15 @@ pub const BR_NETFILTER_V4_PATH: &str = "/proc/sys/net/bridge/bridge-nf-call-ipta
 /// Go `/proc/sys/net/bridge/bridge-nf-call-ip6tables`.
 pub const BR_NETFILTER_V6_PATH: &str = "/proc/sys/net/bridge/bridge-nf-call-ip6tables";
 
+/// Go main.go:107 `errCanceled = errors.New("canceled")`: `getConfig`
+/// returns it when the context is done while it retries for the network
+/// config (main.go:543-545), and main.go:276-278 exits 0 on it. Typed,
+/// like flannel-core's `Interrupted` sentinel, so the daemon downcasts
+/// (`err.is::<Canceled>()`) instead of comparing error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("canceled")]
+pub struct Canceled;
+
 /// Go: `errors.Is(err, context.DeadlineExceeded)` around the kube
 /// subnet manager constructor. The Rust kube port surfaces this as the
 /// "context deadline exceeded" bail of `wait_synced` (informer initial
@@ -73,7 +82,7 @@ pub async fn get_config(
             Err(e) => tracing::error!("Couldn't fetch network config: {e}"),
         }
         tokio::select! {
-            _ = ctx.cancelled() => return Err(anyhow::anyhow!("canceled")),
+            _ = ctx.cancelled() => return Err(Canceled.into()),
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
@@ -153,5 +162,17 @@ mod tests {
         assert!(is_timeout_like(&timeout));
         let other = anyhow::anyhow!("connection refused");
         assert!(!is_timeout_like(&other));
+    }
+
+    #[test]
+    fn canceled_sentinel_is_typed_not_a_string_compare() {
+        // Go getConfig returns errCanceled (main.go:545) and main exits 0
+        // on it via `err == errCanceled` (main.go:276). The port's daemon
+        // must downcast the typed sentinel instead of matching the text
+        // "canceled" (any error string would have matched before).
+        let err: anyhow::Error = Canceled.into();
+        assert_eq!(err.to_string(), "canceled");
+        assert!(err.is::<Canceled>());
+        assert!(!err.is::<flannel_core::subnet::Interrupted>());
     }
 }

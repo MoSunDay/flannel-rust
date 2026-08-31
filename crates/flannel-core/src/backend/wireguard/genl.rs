@@ -4,10 +4,12 @@
 //! Blocking std I/O: async callers must use `spawn_blocking`.
 //! GETFAMILY needs NLM_F_ACK or recv blocks forever; wg command ids
 //! come from CTRL_ATTR_OPS (dump-capable op = GET_DEVICE, do-capable =
-//! SET_DEVICE, fallback 1/2; some kernels use 0/1 not mainline 1/2).
+//! SET_DEVICE, hardcoded fallback 1/2; mainline ids are GET=0 / SET=1,
+//! see include/uapi/linux/wireguard.h).
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use tracing::error;
 
 #[cfg(test)]
 #[path = "genl_tests.rs"]
@@ -19,6 +21,11 @@ const CTRL_ATTR_FAMILY_NAME: u16 = 2;
 const CTRL_ATTR_OPS: u16 = 6;
 const CTRL_ATTR_OP_ID: u16 = 1;
 const CTRL_ATTR_OP_FLAGS: u16 = 2;
+// CTRL_ATTR_OP_FLAGS capability bits, exactly as the kernel reports
+// them in include/uapi/linux/genetlink.h: GENL_ADMIN_PERM = 0x01,
+// GENL_CMD_CAP_DO = 0x02, GENL_CMD_CAP_DUMP = 0x04,
+// GENL_CMD_CAP_HASPOL = 0x08 (GENL_UNS_ADMIN_PERM = 0x10 may be ORed
+// in for privileged ops). 0x01/0x02 would be wrong: 0x01 is ADMIN_PERM.
 const GENL_CMD_CAP_DO: u32 = 0x02;
 const GENL_CMD_CAP_DUMP: u32 = 0x04;
 const NLM_F_REQUEST: u16 = 1;
@@ -248,7 +255,9 @@ impl GenlSocket {
                 }
                 let body = &buf[off + 16..off + mlen];
                 if mtype == NLMSG_ERROR {
-                    let code = i32::from_ne_bytes(body[0..4].try_into().unwrap());
+                    // Never slice blindly: a malformed/truncated error
+                    // message must not panic (see `error_code_of`).
+                    let code = error_code_of(body)?;
                     if code != 0 {
                         return Err(io::Error::from_raw_os_error(-code));
                     }
@@ -277,35 +286,8 @@ impl GenlSocket {
             &nla_str(CTRL_ATTR_FAMILY_NAME, name),
         )?;
         for m in msgs {
-            let (mut fam, mut get_cmd, mut set_cmd) = (None, None, None);
-            for (t, v) in parse_nlas(&m[4..]) {
-                match t {
-                    CTRL_ATTR_FAMILY_ID => fam = u16_of(&v),
-                    CTRL_ATTR_OPS => {
-                        for (_, op) in parse_nlas(&v) {
-                            let (mut id, mut flags) = (None, 0u32);
-                            for (ot, ov) in parse_nlas(&op) {
-                                if ot == CTRL_ATTR_OP_ID && !ov.is_empty() {
-                                    id = Some(ov[0]);
-                                }
-                                if ot == CTRL_ATTR_OP_FLAGS {
-                                    flags = u32_of(&ov).unwrap_or(0);
-                                }
-                            }
-                            let Some(id) = id else { continue };
-                            if flags & GENL_CMD_CAP_DUMP != 0 && get_cmd.is_none() {
-                                get_cmd = Some(id);
-                            }
-                            if flags & GENL_CMD_CAP_DO != 0 && set_cmd.is_none() {
-                                set_cmd = Some(id);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(fam) = fam {
-                return Ok((fam, get_cmd.unwrap_or(1), set_cmd.unwrap_or(2)));
+            if let Ok(resolved) = parse_family_ops(name, m.get(4..).unwrap_or(&[])) {
+                return Ok(resolved);
             }
         }
         Err(io::Error::new(
@@ -313,6 +295,80 @@ impl GenlSocket {
             format!("generic netlink family {name} not found"),
         ))
     }
+}
+
+/// Error code of an NLMSG_ERROR body: the first 4 bytes (the `error`
+/// field of `struct nlmsgerr`; kernels append the echoed header). A
+/// truncated body (malformed, kernel-controlled message) yields
+/// InvalidData instead of a panic.
+fn error_code_of(body: &[u8]) -> io::Result<i32> {
+    match body.get(0..4).and_then(|b| <[u8; 4]>::try_from(b).ok()) {
+        Some(b) => Ok(i32::from_ne_bytes(b)),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("short netlink NLMSG_ERROR body ({} bytes)", body.len()),
+        )),
+    }
+}
+
+/// Resolve (family id, get_cmd, set_cmd) from a GETFAMILY reply body
+/// (payload after the 4-byte genlmsghdr); NotFound if the body carries
+/// no family id. Pure helper of [`GenlSocket::resolve_family_ops`].
+///
+/// Wireguard ops are told apart by the CTRL_ATTR_OP_FLAGS capability
+/// bits (include/uapi/linux/genetlink.h): the dump-capable op is
+/// GET_DEVICE, the do-capable one SET_DEVICE. Missing ops fall back to
+/// the hardcoded ids 1/2.
+fn parse_family_ops(name: &str, body: &[u8]) -> io::Result<(u16, u8, u8)> {
+    let (mut fam, mut get_cmd, mut set_cmd) = (None, None, None);
+    for (t, v) in parse_nlas(body) {
+        match t {
+            CTRL_ATTR_FAMILY_ID => fam = u16_of(&v),
+            CTRL_ATTR_OPS => {
+                for (_, op) in parse_nlas(&v) {
+                    let (mut id, mut flags) = (None, 0u32);
+                    for (ot, ov) in parse_nlas(&op) {
+                        if ot == CTRL_ATTR_OP_ID && !ov.is_empty() {
+                            id = Some(ov[0]);
+                        }
+                        if ot == CTRL_ATTR_OP_FLAGS {
+                            flags = u32_of(&ov).unwrap_or(0);
+                        }
+                    }
+                    let Some(id) = id else { continue };
+                    if flags & GENL_CMD_CAP_DUMP != 0 && get_cmd.is_none() {
+                        get_cmd = Some(id);
+                    }
+                    if flags & GENL_CMD_CAP_DO != 0 && set_cmd.is_none() {
+                        set_cmd = Some(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(fam) = fam else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("generic netlink family {name} not found"),
+        ));
+    };
+    // Guard against capability-flag regressions: GET and SET are
+    // distinct wireguard ops, so both resolving to the same command id
+    // means the flags were misread (e.g. DO/DUMP swapped) and every SET
+    // would go to a dump-only op (-EOPNOTSUPP). Fall back instead.
+    let (get_cmd, set_cmd) = match (get_cmd, set_cmd) {
+        (Some(get), Some(set)) if get == set => {
+            error!(
+                family = name,
+                cmd = get,
+                "generic netlink GET and SET resolved to the same command; using fallback ids"
+            );
+            (None, None)
+        }
+        (get, set) => (get, set),
+    };
+    Ok((fam, get_cmd.unwrap_or(1), set_cmd.unwrap_or(2)))
 }
 
 impl Drop for GenlSocket {

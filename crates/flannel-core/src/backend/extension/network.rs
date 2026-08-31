@@ -1,9 +1,12 @@
 //! Port of extension_network.go (upstream cdf76059): the extension
 //! `network` struct, its `Run` loop and `handleSubnetEvents`.
 //!
-//! Go deviation: Go's `Run` drives `WatchLeases` from a goroutine and
-//! `defer wg.Wait()`s it; the Rust port drives the watch future in the
-//! same task via `tokio::select!` (same shape as the vxlan port).
+//! Go's `Run` spawns a goroutine feeding the `evts` channel (owned by
+//! `subnet.WatchLeases`) and returns when the channel closes; `defer
+//! wg.Wait()` joins the goroutine. The Rust port mirrors that exactly:
+//! the watch runs as its own task that owns the channel sender, so the
+//! sender drops -- and `recv()` observes the close -- the moment the
+//! watch ends.
 
 use super::{run_cmd, split_command, ExtensionConfig, BACKEND_TYPE};
 use crate::backend::traits::Network;
@@ -45,28 +48,31 @@ impl Network for ExtensionNetwork {
         self.mtu
     }
 
-    /// Go: `Run`: watch for subnet lease events and handle each batch.
+    /// Go: `Run`: watch for subnet lease events and handle each batch
+    /// until the events channel closes (extension_network.go:48-68).
     fn run<'a>(&'a self, ctx: Ctx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             info!("Watching for new subnet leases");
             let (ev_tx, mut ev_rx) = mpsc::channel::<Vec<Event>>(1);
-            let watch = watch_leases(ctx, &*self.sm, &self.lease, ev_tx);
-            tokio::pin!(watch);
-            let mut watch_done = false;
 
-            loop {
-                tokio::select! {
-                    biased;
-                    batch = ev_rx.recv() => match batch {
-                        Some(b) => handle_subnet_events(&self.cfg, &b),
-                        None => {
-                            info!("evts chan closed");
-                            return;
-                        }
-                    },
-                    _ = &mut watch, if !watch_done => { watch_done = true; }
-                }
+            // Go: `go func() { subnet.WatchLeases(ctx, n.sm, n.lease, evts)
+            // }()`. The spawned task owns the sender: when the watch ends
+            // (ctx done or manager end) the channel closes.
+            let watch_task = tokio::spawn({
+                let sm = self.sm.clone();
+                let own_lease = self.lease.clone();
+                let token = ctx.clone();
+                async move { watch_leases(&token, &*sm, &own_lease, ev_tx).await }
+            });
+
+            // Go: `evtBatch, ok := <-evts; if !ok { log; return }`.
+            while let Some(batch) = ev_rx.recv().await {
+                handle_subnet_events(&self.cfg, &batch);
             }
+            info!("evts chan closed");
+
+            // Go: `defer wg.Wait()`.
+            let _ = watch_task.await;
         })
     }
 }

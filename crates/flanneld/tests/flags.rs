@@ -89,6 +89,45 @@ fn help_and_unknown_flags() {
     let _ = options_from_flag_set(&fs);
 }
 
+#[test]
+fn parsed_options_install_signal_handlers() {
+    // Go parity: the standalone binary installs its SIGINT/SIGTERM
+    // handlers. Not a CLI flag (upstream has none): always `true` from
+    // the flag set; embedders flip the `Options` field in code.
+    let opts = options_from_flag_set(&parse(&[]));
+    assert!(opts.install_signal_handlers);
+
+    let fs = parse(&["--kube-subnet-mgr", "--ip-masq"]);
+    assert!(options_from_flag_set(&fs).install_signal_handlers);
+}
+
+#[test]
+fn default_options_carry_registry_defaults() {
+    // Options::default() must share ONE source of truth with the CLI
+    // flag registry (Go main.go init()): a hand-mirrored Default once
+    // zeroed margin/resync, which insta-exits at the daemon's
+    // `margin <= 0` check and busy-loops the iptables resync.
+    let parsed = options_from_flag_set(&parse(&[]));
+    assert_eq!(Options::default(), parsed);
+
+    let d = Options::default();
+    assert_eq!(d.subnet_lease_renew_margin, 60, "Go main.go:127 default");
+    assert!(d.subnet_lease_renew_margin > 0);
+    assert_eq!(d.iptables_resync_seconds, 5, "Go main.go:137 default");
+    assert!(d.iptables_resync_seconds > 0);
+    assert_eq!(d.subnet_file, "/run/flannel/subnet.env");
+    assert_eq!(d.net_config_path, "/etc/kube-flannel/net-conf.json");
+    assert_eq!(d.healthz_ip, "0.0.0.0");
+    assert_eq!(d.healthz_port, 0);
+    assert_eq!(
+        d.etcd_endpoints,
+        "http://127.0.0.1:4001,http://127.0.0.1:2379"
+    );
+    assert!(d.iptables_forward_rules);
+    assert!(d.set_node_network_unavailable);
+    assert!(d.install_signal_handlers, "Go parity, not a CLI flag");
+}
+
 #[tokio::test]
 async fn run_prints_version_and_exits_zero() {
     let opts = Options {

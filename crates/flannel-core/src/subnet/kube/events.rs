@@ -56,9 +56,21 @@ pub(crate) async fn handle_add_lease_event(env: &EventEnv<'_>, et: EventType, no
     .await;
 }
 
-/// Go: `handleUpdateLeaseEvent(ctx, oldObj, newObj)`: verifies anything
-/// relevant changed (backend-data, backend-type, public-ip per family).
-/// Ported exactly, including Go's sequential `changed` overwrites.
+/// Go: `handleUpdateLeaseEvent(ctx, oldObj, newObj)` (kube.go:312-339):
+/// emits an `Added` event for a node whose lease-relevant annotations
+/// changed (backend-data/-v6-data, backend-type, public-ip/-v6).
+///
+/// Exact upstream semantics (kube.go:318-335, pinned by events_tests.rs):
+/// `changed` starts `true` and each ENABLED family AND-clears it
+/// (`if <all three of that family's annotations equal> { changed =
+/// false }`). The v6 block runs after the v4 block and overwrites its
+/// verdict, so:
+/// - v4-only: event iff any v4 annotation changed;
+/// - v6-only: event iff any v6 annotation changed;
+/// - dual-stack: event only when BOTH families changed. A change
+///   confined to one family (e.g. only backend-v6-data) is cleared away
+///   by the other family's block and emits NO event. That dual-stack
+///   single-family quirk is upstream behaviour, kept on purpose.
 pub(crate) async fn handle_update_lease_event(env: &EventEnv<'_>, old: &Node, new: &Node) {
     let o = &old.metadata.annotations;
     let n = &new.metadata.annotations;

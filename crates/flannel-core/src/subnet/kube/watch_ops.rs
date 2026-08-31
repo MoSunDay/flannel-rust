@@ -10,6 +10,15 @@
 //!   run independently.
 //! - Go's `WatchLease` returns `ErrUnimplemented`; this port implements
 //!   it as a filter for the single subnet (sn, sn6).
+//! - `GetStoredMacAddresses` reads the NORMALIZED annotation keys
+//!   (`newAnnotations(prefix).BackendData/BackendV6Data`, i.e. the keys
+//!   flannel itself writes); Go kube.go:711/719 builds the read key from
+//!   the raw `--kube-annotation-prefix` + "/backend-data", which only
+//!   coincides with the written key when normalization appends "/"
+//!   (default prefix). For a prefix like `example.com/flannel`
+//!   (normalized to `example.com/flannel-`) Go reads a key it never
+//!   wrote; `GetStoredPublicIP` (kube.go:748-749) already reads the
+//!   normalized keys. We always read the normalized keys.
 
 use crate::ip::{IP4Net, IP6Net};
 use crate::lease::{Event, LeaseWatchResult};
@@ -98,6 +107,12 @@ pub(crate) async fn watch_lease(
 /// Quirk kept: Go trims the chars `"` and `}` from both ends of the raw
 /// annotation (`{"VNI":1,"VtepMAC":"aa:bb.."}` -> `..,"VtepMAC":"aa:bb..`)
 /// then splits on `:"` and takes part 1 when there are exactly 2 parts.
+///
+/// Reads the NORMALIZED keys `annotations.backend_data` /
+/// `backend_v6_data` - the exact keys flannel patches onto the node -
+/// instead of Go kube.go:711/719's raw-prefix
+/// `fmt.Sprintf("%s/backend-data", ksm.annotationPrefix)`; see the
+/// module-level deviation note.
 pub(crate) async fn get_stored_mac_addresses(
     mgr: &KubeSubnetManager,
     _ctx: Ctx<'_>,
@@ -113,8 +128,8 @@ pub(crate) async fn get_stored_mac_addresses(
     let ann = &node.metadata.annotations;
     tracing::info!("List of node({}) annotations: {ann:?}", mgr.node_name);
 
-    let macv4 = extract_mac(ann.get(&format!("{}/backend-data", mgr.annotation_prefix)));
-    let macv6 = extract_mac(ann.get(&format!("{}/backend-v6-data", mgr.annotation_prefix)));
+    let macv4 = extract_mac(ann.get(&mgr.annotations.backend_data));
+    let macv6 = extract_mac(ann.get(&mgr.annotations.backend_v6_data));
     (macv4, macv6)
 }
 

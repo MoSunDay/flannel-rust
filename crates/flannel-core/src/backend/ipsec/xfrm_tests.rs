@@ -97,3 +97,89 @@ fn flannel_pair_both_directions() {
         assert!(get_policy(s).unwrap().is_none());
     }
 }
+
+// --- reply-parsing robustness (no kernel needed) ---
+
+use super::{parse_reply, short_reply_error, MAX_SHORT_REPLIES, NLMSG_DONE, NLMSG_ERROR};
+
+/// One netlink message: mlen/mtype header + zeroed flags/seq/port, body
+/// padded to the 4-byte alignment the kernel uses.
+fn nlmsg(mtype: u16, body: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(16 + body.len());
+    m.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+    m.extend_from_slice(&mtype.to_ne_bytes());
+    m.extend_from_slice(&0u16.to_ne_bytes());
+    m.extend_from_slice(&0u32.to_ne_bytes());
+    m.extend_from_slice(&0u32.to_ne_bytes());
+    m.extend_from_slice(body);
+    m.resize((m.len() + 3) & !3, 0);
+    m
+}
+
+#[test]
+fn parse_reply_collects_bodies_and_ack() {
+    let buf = [
+        nlmsg(19, b"body0"),
+        nlmsg(19, b"body1"),
+        nlmsg(NLMSG_DONE, b""),
+    ]
+    .concat();
+    let (bodies, done, shorts) = parse_reply(&buf).unwrap();
+    assert_eq!(bodies, [b"body0".to_vec(), b"body1".to_vec()]);
+    assert!(done);
+    assert_eq!(shorts, 0);
+}
+
+#[test]
+fn parse_reply_nonzero_error_is_os_error() {
+    let buf = [nlmsg(19, b"x"), nlmsg(NLMSG_ERROR, &(-2i32).to_ne_bytes())].concat();
+    let e = parse_reply(&buf).expect_err("nonzero NLMSG_ERROR");
+    assert_eq!(e.raw_os_error(), Some(2)); // ENOENT, like the Go client
+}
+
+#[test]
+fn parse_reply_skips_short_messages_without_panic() {
+    // a length word below the 16-byte header minimum is skipped and
+    // ends that recv pass (no body, no panic, not done)
+    let short_len = [(8u32).to_ne_bytes().as_slice(), &[7u8; 16]].concat();
+    let (bodies, done, shorts) = parse_reply(&short_len).unwrap();
+    assert!(bodies.is_empty() && !done && shorts == 1);
+    // a message whose body is truncated against the recv buffer
+    let truncated = nlmsg(19, &[0u8; 40])[..16].to_vec();
+    let (bodies, done, shorts) = parse_reply(&truncated).unwrap();
+    assert!(bodies.is_empty() && !done && shorts == 1);
+    // a NLMSG_ERROR too short to carry its 4-byte error code is
+    // malformed too: skipped, not pushed as an empty reply body
+    let (bodies, done, shorts) = parse_reply(&nlmsg(NLMSG_ERROR, b"")).unwrap();
+    assert!(bodies.is_empty() && !done && shorts == 1);
+}
+
+#[test]
+fn parse_reply_continues_after_short_nlmsg_error() {
+    // skipping a short NLMSG_ERROR does not abort the pass: the real
+    // ACK behind it still finishes the reply with no bodies
+    let buf = [
+        nlmsg(NLMSG_ERROR, b""),
+        nlmsg(NLMSG_ERROR, &0i32.to_ne_bytes()),
+    ]
+    .concat();
+    let (bodies, done, shorts) = parse_reply(&buf).unwrap();
+    assert!(bodies.is_empty() && done && shorts == 1);
+}
+
+#[test]
+fn parse_reply_empty_buffer() {
+    let (bodies, done, shorts) = parse_reply(&[]).unwrap();
+    assert!(bodies.is_empty() && !done && shorts == 0);
+}
+
+#[test]
+fn short_reply_error_bails_at_the_bound() {
+    // consecutive short replies accumulate toward the bail; just under
+    // it is fine, at it the request fails instead of spinning forever.
+    assert!(short_reply_error(0).is_none());
+    assert!(short_reply_error(MAX_SHORT_REPLIES - 1).is_none());
+    let e = short_reply_error(MAX_SHORT_REPLIES).expect("bail");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(e.to_string().contains("short replies"));
+}

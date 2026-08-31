@@ -167,7 +167,12 @@ pub fn build_flag_set() -> FlagSet {
 }
 
 /// Parsed command line configuration (Go `CmdLineOpts`). Plain data.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Deviation from Go (no upstream counterpart): `install_signal_handlers`
+/// lets an embedding process own SIGINT/SIGTERM. Every other field keeps
+/// its Go zero value; this one defaults to `true` so the default path is
+/// exactly Go's.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     pub etcd_endpoints: String,
     pub etcd_prefix: String,
@@ -197,6 +202,26 @@ pub struct Options {
     pub blackhole_route: bool,
     pub net_config_path: String,
     pub set_node_network_unavailable: bool,
+    /// Port extension, NOT a CLI flag (upstream flanneld has no such
+    /// flag and its CLI surface must not change): when `false`, flanneld
+    /// installs no SIGINT/SIGTERM handlers and the embedder (e.g.
+    /// init-pro, driving a `CancellationToken` from `tokio::signal`)
+    /// cancels `run` itself. Defaults to `true` (Go parity).
+    pub install_signal_handlers: bool,
+}
+
+/// `Default` delegates to the CLI flag registry so there is ONE source
+/// of Go's flag defaults (main.go `init()`): a hand-mirrored `Default`
+/// silently drifts, and a derived one would zero
+/// `subnet_lease_renew_margin` / `iptables_resync_seconds` — tripping
+/// the daemon's `margin <= 0` startup check (Go main.go:232-235) and
+/// busy-looping the resync period. The embedder-only
+/// `install_signal_handlers: true` comes from `options_from_flag_set`
+/// (Go parity; upstream has no such flag).
+impl Default for Options {
+    fn default() -> Self {
+        options_from_flag_set(&build_flag_set())
+    }
 }
 
 /// Collect the parsed flag values into [`Options`] (Go binds the flags
@@ -231,5 +256,8 @@ pub fn options_from_flag_set(fs: &FlagSet) -> Options {
         blackhole_route: fs.get_bool("ip-blackhole-route"),
         net_config_path: fs.get_string("net-config-path"),
         set_node_network_unavailable: fs.get_bool("set-node-network-unavailable"),
+        // Go parity default; deliberately not a CLI flag (upstream has
+        // no such flag). Embedders flip this field directly in code.
+        install_signal_handlers: true,
     }
 }

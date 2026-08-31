@@ -351,6 +351,46 @@ async fn stored_mac_addresses_and_public_ips_are_read_back() {
     );
 }
 
+/// A slash-carrying custom prefix normalizes to `example.com/flannel-...`
+/// annotation keys (Go kube.go:711/719 reads the raw
+/// `example.com/flannel/backend-data` and would miss them - see
+/// watch_ops.rs). The stored MACs must be found anyway.
+#[tokio::test]
+async fn custom_prefix_stored_macs_use_normalized_keys() {
+    const CUSTOM: &str = "example.com/flannel";
+    let _guard = ENV_LOCK.lock().await;
+    let _node = EnvGuard::set("NODE_NAME", "node1");
+    let (api_url, api) = MockApiserver::start().await;
+    let mut ann = BTreeMap::new();
+    // Keys as `new_annotations(CUSTOM)` normalizes them ("-" appended):
+    // exactly what flannel patches onto the node.
+    ann.insert(
+        format!("{CUSTOM}-backend-data"),
+        r#"{"VNI":1,"VtepMAC":"12:c6:65:89:b4:e3"}"#.into(),
+    );
+    ann.insert(
+        format!("{CUSTOM}-backend-v6-data"),
+        r#"{"VNI":2,"VtepMAC":"22:aa:bb:cc:dd:ee"}"#.into(),
+    );
+    api.put_node("node1", &["10.244.1.0/24"], &ann);
+    let (_dir, conf) = write_conf(VXLAN_CONF);
+
+    let client = KubeClient::new(from_api_url(&api_url).unwrap()).unwrap();
+    let cancel = CancellationToken::new();
+    let mgr = new_subnet_manager(&cancel, client, CUSTOM, conf.to_str().unwrap(), true)
+        .await
+        .unwrap();
+
+    let (macv4, macv6) = mgr.get_stored_mac_addresses(&cancel).await;
+    assert_eq!(
+        (macv4, macv6),
+        (
+            "12:c6:65:89:b4:e3".to_string(),
+            "22:aa:bb:cc:dd:ee".to_string()
+        )
+    );
+}
+
 #[tokio::test]
 async fn alloc_backend_disables_informer_and_acquires_via_direct_get() {
     let _guard = ENV_LOCK.lock().await;

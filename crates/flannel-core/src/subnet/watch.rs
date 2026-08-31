@@ -8,16 +8,32 @@
 //! the completed future), so any buffered batches are drained with
 //! `try_recv` before returning -- the moral equivalent of Go's channel
 //! close (`for range` end).
+//!
+//! Go deviation (failure semantics): a watch error never ends the watch.
+//! Go's run loops treat the watch as eternal -- a dead watch goroutine
+//! leaves the `for range` parked instead of tearing down routes -- and
+//! upstream watch.go retries manager errors with backoff, returning only
+//! when the context is done. `watch_leases` mirrors that: manager errors
+//! are logged and the watch session is re-established after an exponential
+//! backoff (1s doubling to 30s); the backoff sleep races `ctx`, so
+//! shutdown is prompt. Only a clean manager end (Go's channel close) or
+//! cancellation returns.
 
 use crate::ip::{IP4Net, IP6Net};
 use crate::lease::{Event, EventType, Lease, LeaseWatchResult, LeaseWatcher};
 use crate::subnet::manager::Manager;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Capacity of the internal watch channel. Go uses an unbuffered channel;
 /// capacity 1 gives the same one-batch backpressure.
 const WATCH_CHAN_CAP: usize = 1;
+
+/// First delay before re-establishing a failed watch session.
+const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Cap of the exponential watch retry backoff.
+const WATCH_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Reduces one [`LeaseWatchResult`] to a batch of events through the
 /// [`LeaseWatcher`] (Go inline logic inside `WatchLeases`): non-empty
@@ -59,8 +75,11 @@ async fn handle_batch_results(
 /// via [`LeaseWatcher`], which also filters out every event whose subnet
 /// matches `own_lease` (including `EventRemoved` of the own lease).
 ///
-/// Returns when the manager's watch finishes, when `receiver` is dropped,
-/// or when `ctx` is cancelled.
+/// Watch errors are retried with backoff until `ctx` is cancelled (see the
+/// module docs); the function returns when the manager's watch session
+/// ends cleanly (`Ok(())`) or `receiver` is dropped. A session whose
+/// channel closes without a terminal result is re-established like an
+/// error (the session future owns its sender for its whole lifetime).
 pub async fn watch_leases<M: Manager + ?Sized>(
     ctx: &CancellationToken,
     sm: &M,
@@ -69,36 +88,56 @@ pub async fn watch_leases<M: Manager + ?Sized>(
 ) {
     // LeaseWatcher is initiated with the Lease of the local node.
     let mut lw = LeaseWatcher::new(own_lease.clone());
-    let (tx, mut rx) = mpsc::channel::<Vec<LeaseWatchResult>>(WATCH_CHAN_CAP);
-    let mut watch = Box::pin(sm.watch_leases(ctx, tx));
+    let mut backoff = WATCH_RETRY_DELAY;
+    loop {
+        let (tx, mut rx) = mpsc::channel::<Vec<LeaseWatchResult>>(WATCH_CHAN_CAP);
+        let mut watch = Box::pin(sm.watch_leases(ctx, tx));
 
-    'outer: loop {
-        tokio::select! {
-            biased;
-            _ = ctx.cancelled() => break,
-            res = rx.recv() => {
-                let Some(watch_results) = res else { break };
-                if !handle_batch_results(&mut lw, &watch_results, &mut receiver).await {
-                    break 'outer;
-                }
-            }
-            res = &mut watch => {
-                // Go: the goroutine logs any error and returns; the
-                // channel close then ends the `for range` loop.
-                if let Err(e) = res {
-                    tracing::error!("could not watch leases: {e}");
-                }
-                while let Ok(watch_results) = rx.try_recv() {
+        'session: loop {
+            tokio::select! {
+                biased;
+                _ = ctx.cancelled() => return,
+                res = rx.recv() => {
+                    let Some(watch_results) = res else { break 'session };
                     if !handle_batch_results(&mut lw, &watch_results, &mut receiver).await {
-                        break 'outer;
+                        return;
                     }
                 }
-                break;
+                res = &mut watch => {
+                    // Go: the goroutine logs any error and returns; the
+                    // channel close then ends the `for range` loop. Drain
+                    // whatever the manager buffered before ending.
+                    while let Ok(watch_results) = rx.try_recv() {
+                        if !handle_batch_results(&mut lw, &watch_results, &mut receiver).await {
+                            return;
+                        }
+                    }
+                    match res {
+                        // Go: the manager closed the channel -- forward loop
+                        // ends, `close(receiver)` follows.
+                        Ok(()) => return,
+                        Err(e) if ctx.is_cancelled() => {
+                            tracing::info!("{e}, close receiver chan");
+                            return;
+                        }
+                        // Go never tears the watch down on errors (upstream
+                        // watch.go retries with backoff): log and retry.
+                        Err(e) => tracing::error!("could not watch leases: {e}"),
+                    }
+                    break 'session;
+                }
             }
         }
+
+        // Re-establish the watch after the backoff; the sleep races ctx so
+        // shutdown never waits out the exponential delay.
+        tokio::select! {
+            biased;
+            _ = ctx.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(WATCH_RETRY_MAX);
     }
-    // Go closes `receiver` here; the mpsc sender is dropped by the caller
-    // once this returns.
 }
 
 /// Maps one single-lease watch result to the event Go forwards: the first

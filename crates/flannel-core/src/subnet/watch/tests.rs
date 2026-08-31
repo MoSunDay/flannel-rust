@@ -58,6 +58,8 @@ struct FakeManager {
     batches: Mutex<VecDeque<Vec<LeaseWatchResult>>>,
     wait_cancel: bool,
     fail_with: Option<String>,
+    /// Number of `run_watch` sessions started (watch_leases retry counter).
+    attempts: Mutex<u32>,
 }
 
 impl FakeManager {
@@ -66,6 +68,7 @@ impl FakeManager {
             batches: Mutex::new(batches.into()),
             wait_cancel,
             fail_with: None,
+            attempts: Mutex::new(0),
         }
     }
 
@@ -74,6 +77,7 @@ impl FakeManager {
             batches: Mutex::new(VecDeque::new()),
             wait_cancel: false,
             fail_with: Some(msg.to_string()),
+            attempts: Mutex::new(0),
         }
     }
 
@@ -85,6 +89,7 @@ impl FakeManager {
         tx: mpsc::Sender<Vec<LeaseWatchResult>>,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
+            *self.attempts.lock().await += 1;
             if let Some(msg) = &self.fail_with {
                 return Err(anyhow::anyhow!("{msg}"));
             }
@@ -245,11 +250,29 @@ async fn watch_leases_empty_events_and_snapshot_removes_stored() {
 }
 
 #[tokio::test]
-async fn watch_leases_manager_error_returns_without_events() {
+async fn watch_leases_retries_manager_errors_until_cancelled() {
+    // Go never tears the watch down on manager errors (upstream watch.go
+    // retries with backoff; only ctx.Done ends it): a permanently failing
+    // manager is retried until the token is cancelled, with no events.
     let own = lease(true, false, "10.1.2.0/24");
-    let got =
-        collect_watch_leases(FakeManager::failing("boom"), own, CancellationToken::new()).await;
-    assert!(got.is_empty());
+    let token = CancellationToken::new();
+    let sm = FakeManager::failing("boom");
+    let (tx_out, mut rx_out) = mpsc::channel(16);
+    let t2 = token.clone();
+    let handle = tokio::spawn(async move {
+        watch_leases(&t2, &sm, &own, tx_out).await;
+        sm
+    });
+    // Give the first session time to fail, the 1s backoff to elapse and a
+    // second session to start (retry evidence), then cancel.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    token.cancel();
+    let sm = handle.await.unwrap();
+    assert!(
+        *sm.attempts.lock().await >= 2,
+        "failed watch was not retried"
+    );
+    assert!(rx_out.recv().await.is_none(), "no events expected");
 }
 
 #[tokio::test]

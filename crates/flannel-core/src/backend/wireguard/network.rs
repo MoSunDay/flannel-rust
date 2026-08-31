@@ -2,9 +2,12 @@
 //! cdf76059): the wireguard `network` struct, its `Run` loop and
 //! `handleSubnetEvents`.
 //!
-//! Go deviation: Go's `Run` drives `WatchLeases` from a goroutine and
-//! `defer wg.Wait()`s it; the Rust port drives the watch future in the
-//! same task via `tokio::select!` (same shape as the other ports).
+//! Go's `Run` spawns a goroutine feeding the `events` channel, selects on
+//! `events` and `ctx.Done()`, and `defer wg.Wait()`s the goroutine. The
+//! Rust port mirrors that: the watch runs as its own task that owns the
+//! channel sender, so the sender drops -- and `recv()` observes the close
+//! -- the moment the watch ends.
+//!
 //! Go deviation: on `GetNetworkConfig` error Go still adds routes for
 //! the zero-valued config; the Rust port logs and skips the routes.
 
@@ -24,6 +27,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+#[cfg(test)]
+#[path = "network_tests.rs"]
+mod network_tests;
 
 /// Port of the Go `network` struct.
 pub(crate) struct WireguardNetwork {
@@ -68,28 +75,43 @@ impl Network for WireguardNetwork {
         self.mtu.saturating_sub(OVERHEAD)
     }
 
-    /// Go: `Run`: watch for subnet lease events and handle each batch.
+    /// Go: `Run` (wireguard_network.go:78-100): spawn the lease watch,
+    /// select over events and ctx.Done until either ends.
     fn run<'a>(&'a self, ctx: Ctx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             info!("Watching for new subnet leases");
             let (ev_tx, mut ev_rx) = mpsc::channel::<Vec<Event>>(1);
-            let watch = watch_leases(ctx, &*self.sm, &self.lease, ev_tx);
-            tokio::pin!(watch);
-            let mut watch_done = false;
+
+            // Go: `go func() { subnet.WatchLeases(ctx, n.sm, n.lease,
+            // events) }()`. The spawned task owns the sender: when the
+            // watch ends (ctx done or manager end) the channel closes.
+            let watch_task = tokio::spawn({
+                let sm = self.sm.clone();
+                let own_lease = self.lease.clone();
+                let token = ctx.clone();
+                async move { watch_leases(&token, &*sm, &own_lease, ev_tx).await }
+            });
 
             loop {
                 tokio::select! {
                     biased;
+                    // Go: `case <-ctx.Done(): return`.
+                    _ = ctx.cancelled() => break,
+                    // Go: `case evtBatch := <-events:` (a closed channel
+                    // would deliver the zero value in Go; here the close
+                    // ends the loop like in the other backends).
                     batch = ev_rx.recv() => match batch {
                         Some(b) => self.handle_subnet_events(ctx, &b).await,
                         None => {
                             info!("evts chan closed");
-                            return;
+                            break;
                         }
                     },
-                    _ = &mut watch, if !watch_done => { watch_done = true; }
                 }
             }
+
+            // Go: `defer wg.Wait()`.
+            let _ = watch_task.await;
         })
     }
 }

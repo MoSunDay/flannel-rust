@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Mutable network state shared by the run loop, the device watcher and
 /// recreate (Go: the nw.dev / nw.v6Dev / nw.mtu fields).
@@ -76,29 +76,48 @@ impl Network for VXLANNetwork {
             .saturating_sub(ENCAP_OVERHEAD)
     }
 
-    /// Go: `Run`. Deviation: Go's `defer wg.Wait()` waits for the two
-    /// goroutines; the Rust port drops the pinned futures instead.
+    /// Go: `Run` (vxlan_network.go:65-114): spawn the lease watch and the
+    /// device watcher (each feeding its own channel), select over the two
+    /// channels until one closes, then join both watchers.
     fn run<'a>(&'a self, ctx: Ctx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             info!("watching for new subnet leases");
+
+            // One netlink handle for the whole run (Go programs routes,
+            // ARP and FDB through the handle created at startup; failing
+            // to open netlink is fatal to the network).
+            let nl = match Netlink::new().await {
+                Ok(nl) => nl,
+                Err(e) => {
+                    error!("failed to open netlink connection: {e}");
+                    return;
+                }
+            };
+
             let (ev_tx, mut ev_rx) = mpsc::channel::<Vec<Event>>(1);
             let (miss_tx, mut miss_rx) = mpsc::channel::<bool>(1);
 
-            let watch = watch_leases(ctx, &*self.sm, &self.lease, ev_tx);
-            tokio::pin!(watch);
-            let dev_watch = self.watch_vxlan_device(ctx, miss_tx);
-            tokio::pin!(dev_watch);
-            let (mut watch_done, mut dev_watch_done) = (false, false);
+            // Go: `wg.Add(1); go func() { subnet.WatchLeases(...) }()` and
+            // `go func() { nw.watchVXLANDevice(ctx, vxlanMissingChan) }()`.
+            // Each spawned task owns its channel sender: when a watcher
+            // ends the channel closes and the loop below sees `None`.
+            let watch_task = tokio::spawn({
+                let sm = self.sm.clone();
+                let own_lease = self.lease.clone();
+                let token = ctx.clone();
+                async move { watch_leases(&token, &*sm, &own_lease, ev_tx).await }
+            });
+            let dev_task =
+                tokio::spawn(watch_vxlan_device(ctx.clone(), self.state.clone(), miss_tx));
 
             loop {
                 tokio::select! {
                     biased;
                     ev = ev_rx.recv() => match ev {
                         Some(batch) => {
-                            let Ok(nl) = Netlink::new().await else { continue };
-                            handle_subnet_events(&nl, &self.state, &batch).await;
+                            handle_subnet_events(ctx, &nl, &self.state, &batch).await;
                         }
-                        None => { info!("leaseEvents chan closed"); return; }
+                        None => { info!("leaseEvents chan closed"); break; }
                     },
                     m = miss_rx.recv() => match m {
                         Some(_) => {
@@ -116,67 +135,66 @@ impl Network for VXLANNetwork {
                                 }
                             });
                         }
-                        None => { info!("vxlanMissingChan closed"); return; }
+                        None => { info!("vxlanMissingChan closed"); break; }
                     },
-                    _ = &mut watch, if !watch_done => {
-                        watch_done = true;
-                        debug!("WatchLeases exited");
-                    }
-                    _ = &mut dev_watch, if !dev_watch_done => {
-                        dev_watch_done = true;
-                        debug!("WatchVXLANDevice exited");
-                    }
                 }
             }
+
+            // Go: `defer wg.Wait()` -- join the two watchers.
+            let _ = (watch_task.await, dev_task.await);
         })
     }
 }
 
-impl VXLANNetwork {
-    /// Go: `watchVXLANDevice`. Deviation: Go `log.Fatalf`s on subscribe
-    /// failure; the Rust port logs an error and returns (the run loop then
-    /// observes the closed channel).
-    async fn watch_vxlan_device(&self, ctx: Ctx<'_>, miss_tx: mpsc::Sender<bool>) {
-        info!("starting vxlan device watcher");
-        let name = {
-            let st = self.state.lock().unwrap();
-            match &st.dev {
-                Some(d) => d.name.clone(),
-                None => String::new(),
-            }
-        };
-        if name.is_empty() {
-            error!("vxlan device is nil, cannot watch for events");
+/// Go: `watchVXLANDevice` (vxlan_network.go:116-146). Runs as its own
+/// task owning `miss_tx` -- Go's `defer close(vxlanMissingChan)` becomes
+/// the sender drop when this future ends. Deviation: Go `log.Fatalf`s on
+/// subscribe failure; the port logs an error and returns (the run loop
+/// then observes the closed channel).
+async fn watch_vxlan_device(
+    ctx: CancellationToken,
+    state: Arc<Mutex<NetState>>,
+    miss_tx: mpsc::Sender<bool>,
+) {
+    info!("starting vxlan device watcher");
+    let name = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        match &st.dev {
+            Some(d) => d.name.clone(),
+            None => String::new(),
+        }
+    };
+    if name.is_empty() {
+        error!("vxlan device is nil, cannot watch for events");
+        return;
+    }
+
+    let groups = [rtnetlink::MulticastGroup::Link];
+    let (conn, _handle, mut messages) = match rtnetlink::new_multicast_connection(&groups) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to subscribe to netlink: {e}");
             return;
         }
+    };
+    tokio::spawn(conn);
 
-        let groups = [rtnetlink::MulticastGroup::Link];
-        let (conn, _handle, mut messages) = match rtnetlink::new_multicast_connection(&groups) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("failed to subscribe to netlink: {e}");
+    loop {
+        tokio::select! {
+            biased;
+            _ = ctx.cancelled() => {
+                info!("stopping vxlan device watcher");
                 return;
             }
-        };
-        tokio::spawn(conn);
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = ctx.cancelled() => {
-                    info!("stopping vxlan device watcher");
-                    return;
-                }
-                msg = messages.next() => {
-                    let Some((msg, _addr)) = msg else { return };
-                    if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(link)) =
-                        msg.payload
-                    {
-                        if super::link_info::link_name(&link) == name {
-                            info!("Interface {name} deleted");
-                            // Go's buffered channel: skip if already queued.
-                            let _ = miss_tx.try_send(true);
-                        }
+            msg = messages.next() => {
+                let Some((msg, _addr)) = msg else { return };
+                if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(link)) =
+                    msg.payload
+                {
+                    if super::link_info::link_name(&link) == name {
+                        info!("Interface {name} deleted");
+                        // Go's buffered channel: skip if already queued.
+                        let _ = miss_tx.try_send(true);
                     }
                 }
             }
@@ -299,7 +317,7 @@ async fn recreate_vxlan(
             continue;
         }
 
-        let mut st = state.lock().unwrap();
+        let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(dev) = dev {
             // Go: nw.dev / nw.mtu = dev.link.Attrs().MTU (the raw link MTU,
             // which MTU() then reduces a second time -- Go quirk kept).

@@ -278,38 +278,91 @@ impl XfrmSocket {
         }
         let mut results = Vec::new();
         let mut buf = vec![0u8; 65536];
+        let mut short_replies = 0usize;
         loop {
             let n =
                 unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
             if n < 0 {
                 return Err(io::Error::last_os_error());
             }
-            let buf = &buf[..n as usize];
-            let (mut off, mut done) = (0usize, false);
-            while off + 16 <= buf.len() {
-                let mlen = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-                if mlen < 16 || off + mlen > buf.len() {
-                    break;
-                }
-                let mtype = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().unwrap());
-                match mtype {
-                    NLMSG_ERROR if mlen >= 20 => {
-                        let code = i32::from_ne_bytes(buf[off + 16..off + 20].try_into().unwrap());
-                        if code != 0 {
-                            return Err(io::Error::from_raw_os_error(-code));
-                        }
-                        done = true; // ACK
-                    }
-                    NLMSG_DONE => done = true,
-                    _ => results.push(buf[off + 16..off + mlen].to_vec()),
-                }
-                off += align4(mlen);
-            }
+            let (bodies, done, shorts) = parse_reply(&buf[..n as usize])?;
+            results.extend(bodies);
             if done {
                 return Ok(results);
             }
+            if shorts > 0 || n == 0 {
+                // Short/truncated messages and empty datagrams never
+                // occur in a healthy exchange; count them per request so
+                // a kernel that keeps replying short cannot spin this
+                // loop (or a nonblocking recv returning 0) forever.
+                short_replies += shorts + usize::from(n == 0);
+                tracing::warn!(
+                    "xfrm netlink: {shorts} short message(s) in a {n}-byte reply, \
+                     {short_replies}/{MAX_SHORT_REPLIES} for this request"
+                );
+                if let Some(e) = short_reply_error(short_replies) {
+                    return Err(e);
+                }
+            }
         }
     }
+}
+
+/// Upper bound on malformed netlink replies tolerated within one
+/// request; the kernel never sends short messages legitimately, so any
+/// count is abnormal and only a runaway loop motivates the limit.
+const MAX_SHORT_REPLIES: usize = 8;
+
+/// The error once `short_replies` malformed replies have piled up in a
+/// single request, else `None`.
+fn short_reply_error(short_replies: usize) -> Option<io::Error> {
+    (short_replies >= MAX_SHORT_REPLIES).then(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("xfrm netlink: {short_replies} consecutive short replies"),
+        )
+    })
+}
+
+/// Parse one recv() buffer of netlink messages: `(bodies, done, shorts)`
+/// where `done` marks NLMSG_DONE / a zero NLMSG_ERROR ACK (a nonzero one
+/// is the OS error, earlier bodies discarded as before) and `shorts`
+/// counts malformed messages that were skipped (logged, never panic).
+fn parse_reply(buf: &[u8]) -> io::Result<(Vec<Vec<u8>>, bool, usize)> {
+    let mut results = Vec::new();
+    let (mut off, mut done, mut shorts) = (0usize, false, 0usize);
+    while off + 16 <= buf.len() {
+        let mlen = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        if mlen < 16 || off + mlen > buf.len() {
+            tracing::warn!(
+                "xfrm netlink: skipping short message mlen={mlen}, {} body bytes left",
+                buf.len() - off
+            );
+            shorts += 1;
+            break;
+        }
+        let mtype = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().unwrap());
+        match mtype {
+            NLMSG_ERROR if mlen >= 20 => {
+                let code = i32::from_ne_bytes(buf[off + 16..off + 20].try_into().unwrap());
+                if code != 0 {
+                    return Err(io::Error::from_raw_os_error(-code));
+                }
+                done = true; // ACK
+            }
+            // An error message without its 4-byte code is malformed like
+            // any other short message: skip it instead of treating the
+            // truncated bytes as a reply body.
+            NLMSG_ERROR => {
+                tracing::warn!("xfrm netlink: skipping short NLMSG_ERROR mlen={mlen}");
+                shorts += 1;
+            }
+            NLMSG_DONE => done = true,
+            _ => results.push(buf[off + 16..off + mlen].to_vec()),
+        }
+        off += align4(mlen);
+    }
+    Ok((results, done, shorts))
 }
 
 impl Drop for XfrmSocket {

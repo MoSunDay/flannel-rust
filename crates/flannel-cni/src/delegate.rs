@@ -11,6 +11,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+#[cfg(test)]
+#[path = "delegate_tests.rs"]
+mod tests;
+
 /// Find the delegate plugin binary named `plugin_type` by searching the
 /// `:`-separated dirs of CNI_PATH; returns the first existing regular
 /// file (upstream libcni `invoke.FindInPath` behavior).
@@ -60,6 +64,12 @@ pub fn delegate_check(conf: &Value, plugin: &Path, args: &CniArgs) -> Result<()>
 }
 
 /// Run the plugin binary with the CNI env vars and `conf` on stdin.
+///
+/// The config is written from a helper thread while
+/// [`Child::wait_with_output`] concurrently drains stdout/stderr: writing
+/// stdin inline before waiting deadlocks against a delegate that fills
+/// its output pipes first (its writes block, so it never reads our
+/// stdin, so our write blocks too).
 fn exec_delegate(plugin: &Path, command: &str, args: &CniArgs, conf: &Value) -> Result<Output> {
     let conf_bytes = serde_json::to_vec(conf).context("failed to serialize delegate config")?;
     let mut child = Command::new(plugin)
@@ -74,14 +84,25 @@ fn exec_delegate(plugin: &Path, command: &str, args: &CniArgs, conf: &Value) -> 
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn delegate plugin {}", plugin.display()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&conf_bytes)
-            .context("failed to write delegate config to plugin stdin")?;
-    }
-    child
+    // ChildStdin is Send; the thread owns it, so dropping it at the end
+    // also closes the pipe (the plugin sees EOF, as with inline writing).
+    let writer = child
+        .stdin
+        .take()
+        .map(|mut stdin| std::thread::spawn(move || stdin.write_all(&conf_bytes)));
+    let out = child
         .wait_with_output()
-        .context("failed to wait for delegate plugin")
+        .context("failed to wait for delegate plugin")?;
+    if let Some(writer) = writer {
+        match writer.join() {
+            Ok(Ok(())) => {}
+            // Same error an inline write would have produced (e.g. the
+            // plugin exited before reading all of stdin).
+            Ok(Err(e)) => return Err(e).context("failed to write delegate config to plugin stdin"),
+            Err(_) => bail!("delegate stdin writer thread panicked"),
+        }
+    }
+    Ok(out)
 }
 
 /// Build the error for a failed delegate run: when stdout parses as a CNI
