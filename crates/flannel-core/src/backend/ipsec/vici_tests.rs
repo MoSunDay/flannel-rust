@@ -184,3 +184,33 @@ fn unload_conn_ok() {
     assert_eq!(recorded[0].0, "unload-conn");
     assert_eq!(recorded[0].1.get_str("name").as_deref(), Some("conn-1"));
 }
+
+#[test]
+fn read_packet_rejects_length_words_beyond_the_cap() {
+    use super::MAX_PACKET_LEN;
+    // Only the 4-byte length word is on the wire: if read_packet sized
+    // its buffer from it before validating, this test would allocate
+    // gigabytes and then fail with UnexpectedEof instead of this error.
+    for len in [MAX_PACKET_LEN as u32 + 1, u32::MAX] {
+        let wire = len.to_be_bytes().to_vec();
+        let err = read_packet(&mut wire.as_slice()).expect_err("{len} must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains(&MAX_PACKET_LEN.to_string()),
+            "error names the limit: {err}"
+        );
+    }
+}
+
+#[test]
+fn read_packet_still_accepts_frames_up_to_the_cap() {
+    use super::MAX_PACKET_LEN;
+    // boundary: a frame of exactly the limit is legitimate
+    let mut body = vec![0xaau8; MAX_PACKET_LEN];
+    body[0] = 7; // packet type byte
+    let mut wire = (MAX_PACKET_LEN as u32).to_be_bytes().to_vec();
+    wire.extend_from_slice(&body);
+    let (ptype, payload) = read_packet(&mut wire.as_slice()).unwrap();
+    assert_eq!(ptype, 7);
+    assert_eq!(payload, vec![0xaa; MAX_PACKET_LEN - 1]);
+}

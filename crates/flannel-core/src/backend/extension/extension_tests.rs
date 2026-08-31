@@ -17,6 +17,7 @@ use futures::future::BoxFuture;
 use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -139,11 +140,15 @@ async fn wait_with_run<F: std::future::Future<Output = ()>>(
 }
 
 /// In-memory Manager: fixed lease, records acquire attrs, replays batches.
+/// `fail_first_watch` makes the first `watch_leases` session fail (used to
+/// prove the run loop keeps serving through a watch error).
 struct MockManager {
     config: Config,
     lease: Lease,
     attrs_seen: Mutex<Option<LeaseAttrs>>,
     batches: Vec<Vec<LeaseWatchResult>>,
+    fail_first_watch: bool,
+    watch_attempts: AtomicU32,
 }
 impl Manager for MockManager {
     fn get_network_config<'a>(&'a self, _ctx: Ctx<'a>) -> BoxFuture<'a, anyhow::Result<Config>> {
@@ -201,6 +206,10 @@ impl Manager for MockManager {
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         let batches = self.batches.clone();
         Box::pin(async move {
+            let attempt = self.watch_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 && self.fail_first_watch {
+                anyhow::bail!("boom");
+            }
             for b in batches {
                 if tx.send(b).await.is_err() {
                     break;
@@ -261,6 +270,8 @@ fn mock_and_ei(batches: Vec<Vec<LeaseWatchResult>>, config: Config) -> Arc<MockM
         lease: test_lease(2),
         attrs_seen: Mutex::new(None),
         batches,
+        fail_first_watch: false,
+        watch_attempts: AtomicU32::new(0),
     })
 }
 /// Loopback iface: always present, so the register-time MTU fetch works
@@ -360,6 +371,161 @@ async fn register_and_run_full_flow() {
     for p in [&post_file, &add_file, &rm_file] {
         let _ = std::fs::remove_file(p);
     }
+}
+
+/// The first watch session fails (Go parity: watch errors never tear down
+/// the run loop -- the watch retries with backoff). The run loop must
+/// still process a batch delivered by the retried session and return on
+/// cancellation.
+#[tokio::test]
+async fn run_retries_failed_watch_and_keeps_serving() {
+    let add_file = tmp_path("add-retry");
+    let add_script = write_exec_script(&format!("echo SUBNET=$SUBNET > {}", add_file.display()));
+    let backend_json = format!("{{\"SubnetAddCommand\":\"{}\"}}", add_script.display());
+    let config = Config {
+        enable_ipv4: true,
+        network: IP4Net {
+            ip: IP4::from_bytes([10, 1, 0, 0]),
+            prefix_len: 16,
+        },
+        subnet_len: 24,
+        backend: Some(RawValue::from_string(backend_json).unwrap()),
+        ..Default::default()
+    };
+    let batch = vec![vec![LeaseWatchResult {
+        events: vec![Event {
+            event_type: EventType::Added,
+            lease: event_lease(3, "extension", "\"payload-add\"", [192, 168, 7, 7]),
+        }],
+        snapshot: vec![],
+    }]];
+    let mock = Arc::new(MockManager {
+        config: config.clone(),
+        lease: test_lease(2),
+        attrs_seen: Mutex::new(None),
+        batches: batch,
+        fail_first_watch: true,
+        watch_attempts: AtomicU32::new(0),
+    });
+    let be = new_backend(mock.clone(), loopback_ei(Some("192.168.1.10"))).unwrap();
+    let ctx = CancellationToken::new();
+    let net = be.register_network(&ctx, &config).await.unwrap();
+
+    let run = net.run(&ctx);
+    tokio::pin!(run);
+    let add = wait_with_run(run.as_mut(), &add_file, "SUBNET=").await;
+    assert_eq!(add, "SUBNET=10.1.3.0/24\n");
+    // The batch was delivered by the RETRIED watch session.
+    assert!(
+        mock.watch_attempts.load(Ordering::SeqCst) >= 2,
+        "watch was not retried after the first failure"
+    );
+
+    ctx.cancel();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run() should return after cancellation");
+    let _ = std::fs::remove_file(&add_file);
+}
+
+/// A wedged watch (a manager future that never yields, even on cancel)
+/// must not prevent run() from returning promptly on cancellation: the
+/// spawned watch task owns the sender and is joined by run().
+#[tokio::test]
+async fn run_returns_on_cancel_with_stalled_watch() {
+    struct StalledManager;
+    impl Manager for StalledManager {
+        fn get_network_config<'a>(
+            &'a self,
+            _ctx: Ctx<'a>,
+        ) -> BoxFuture<'a, anyhow::Result<Config>> {
+            Box::pin(async { Ok(Config::default()) })
+        }
+        fn handle_subnet_file<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Config,
+            _: bool,
+            _: IP4Net,
+            _: IP6Net,
+            _: u32,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn acquire_lease<'a>(
+            &'a self,
+            _ctx: Ctx<'a>,
+            _attrs: &'a LeaseAttrs,
+        ) -> BoxFuture<'a, anyhow::Result<Lease>> {
+            Box::pin(async { Ok(test_lease(2)) })
+        }
+        fn renew_lease<'a>(
+            &'a self,
+            _ctx: Ctx<'a>,
+            lease: &'a Lease,
+        ) -> BoxFuture<'a, anyhow::Result<Lease>> {
+            Box::pin(async move { Ok(lease.clone()) })
+        }
+        fn watch_lease<'a>(
+            &'a self,
+            _: Ctx<'a>,
+            _: IP4Net,
+            _: IP6Net,
+            _: mpsc::Sender<Vec<LeaseWatchResult>>,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(std::future::pending())
+        }
+        fn watch_leases<'a>(
+            &'a self,
+            _ctx: Ctx<'a>,
+            tx: mpsc::Sender<Vec<LeaseWatchResult>>,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            // Wedged watcher: ignores even the cancellation token, keeps
+            // its session channel open (a dropped sender would look like
+            // an ended session and be retried instead of stalled).
+            Box::pin(async move {
+                let _keep_open = tx;
+                std::future::pending().await
+            })
+        }
+        fn complete_lease<'a>(
+            &'a self,
+            _ctx: Ctx<'a>,
+            _lease: &'a Lease,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn get_stored_mac_addresses<'a>(&'a self, _c: Ctx<'a>) -> BoxFuture<'a, (String, String)> {
+            Box::pin(async { (String::new(), String::new()) })
+        }
+        fn get_stored_public_ip<'a>(&'a self, _c: Ctx<'a>) -> BoxFuture<'a, (String, String)> {
+            Box::pin(async { (String::new(), String::new()) })
+        }
+        fn name(&self) -> String {
+            "stalled".to_string()
+        }
+    }
+    let config = Config {
+        enable_ipv4: true,
+        network: IP4Net {
+            ip: IP4::from_bytes([10, 1, 0, 0]),
+            prefix_len: 16,
+        },
+        subnet_len: 24,
+        ..Default::default()
+    };
+    let be = new_backend(Arc::new(StalledManager), loopback_ei(Some("192.168.1.10"))).unwrap();
+    let ctx = CancellationToken::new();
+    let net = be.register_network(&ctx, &config).await.unwrap();
+
+    let tok = ctx.clone();
+    let handle = tokio::spawn(async move { net.run(&tok).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ctx.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("run() should return after cancellation despite the stalled watch")
+        .unwrap();
 }
 #[tokio::test]
 async fn register_error_paths() {

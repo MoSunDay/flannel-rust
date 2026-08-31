@@ -11,6 +11,7 @@ use crate::ip::iface::{direct_routing, Netlink};
 use crate::ip::{IP4Net, IP6Net};
 use crate::lease::Event;
 use crate::mac::{mac_to_string, MacAddr};
+use crate::subnet::manager::Ctx;
 use anyhow::anyhow;
 use netlink_packet_route::route::RouteMessage;
 use rtnetlink::RouteMessageBuilder;
@@ -50,7 +51,12 @@ impl<'de> Deserialize<'de> for MacJson {
 }
 
 /// Go: `handleSubnetEvents`.
-pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, batch: &[Event]) {
+pub(super) async fn handle_subnet_events(
+    ctx: Ctx<'_>,
+    nl: &Netlink,
+    state: &Mutex<NetState>,
+    batch: &[Event],
+) {
     for event in batch {
         let sn = event.lease.subnet;
         let v6_sn = event.lease.ipv6_subnet;
@@ -66,7 +72,7 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
 
         // Go reads nw.dev / nw.v6Dev at event time; snapshot them.
         let (dev, v6_dev) = {
-            let st = state.lock().unwrap();
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
             (st.dev.clone(), st.v6_dev.clone())
         };
 
@@ -139,7 +145,7 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
                                 "Adding direct route to subnet: {sn} PublicIP: {}",
                                 attrs.public_ip
                             );
-                            if let Err(e) = retry_do(|| route_replace(nl, dr)).await {
+                            if let Err(e) = retry_do(ctx, || route_replace(nl, dr)).await {
                                 error!("Error adding route to {sn} via {}: {e}", attrs.public_ip);
                                 continue;
                             }
@@ -149,21 +155,21 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
                                 attrs.public_ip,
                                 mac_to_string(mac)
                             );
-                            if let Err(e) = retry_do(|| add_arp(nl, dev, mac, gw)).await {
+                            if let Err(e) = retry_do(ctx, || add_arp(nl, dev, mac, gw)).await {
                                 error!("AddARP failed: {e}");
                                 continue;
                             }
-                            if let Err(e) = retry_do(|| add_fdb(nl, dev, mac, vtep)).await {
+                            if let Err(e) = retry_do(ctx, || add_fdb(nl, dev, mac, vtep)).await {
                                 error!("AddFDB failed: {e}");
                                 // Clean up the ARP entry then continue.
-                                if let Err(e) = retry_do(|| del_arp(nl, dev, mac, gw)).await {
+                                if let Err(e) = retry_do(ctx, || del_arp(nl, dev, mac, gw)).await {
                                     error!("DelARP failed: {e}");
                                 }
                                 continue;
                             }
                             // Set the route last: the kernel would ARP for
                             // Gw if it were not already set above.
-                            if let Err(e) = retry_do(|| route_replace(nl, vxr)).await {
+                            if let Err(e) = retry_do(ctx, || route_replace(nl, vxr)).await {
                                 error!("failed to add vxlanRoute ({sn} -> {}): {e}", sn.ip);
                                 // Go: cleanup without retry on this path.
                                 if let Err(e) = del_arp(nl, dev, mac, gw).await {
@@ -191,7 +197,7 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
                             debug!(
                                 "Adding v6 direct route to v6 subnet: {v6_sn} PublicIPv6: {pub6}"
                             );
-                            if let Err(e) = retry_do(|| route_replace(nl, dr)).await {
+                            if let Err(e) = retry_do(ctx, || route_replace(nl, dr)).await {
                                 error!("Error adding v6 route to {v6_sn} via {pub6}: {e}");
                                 continue;
                             }
@@ -200,26 +206,27 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
                                 "adding v6 subnet: {v6_sn} PublicIPv6: {pub6} VtepMAC: {}",
                                 mac_to_string(mac)
                             );
-                            if let Err(e) = retry_do(|| add_arp(nl, dev, mac, gw)).await {
+                            if let Err(e) = retry_do(ctx, || add_arp(nl, dev, mac, gw)).await {
                                 error!("AddV6ARP failed: {e}");
                                 continue;
                             }
-                            if let Err(e) = retry_do(|| add_fdb(nl, dev, mac, vtep)).await {
+                            if let Err(e) = retry_do(ctx, || add_fdb(nl, dev, mac, vtep)).await {
                                 error!("AddV6FDB failed: {e}");
-                                if let Err(e) = retry_do(|| del_arp(nl, dev, mac, gw)).await {
+                                if let Err(e) = retry_do(ctx, || del_arp(nl, dev, mac, gw)).await {
                                     error!("DelV6ARP failed: {e}");
                                 }
                                 continue;
                             }
-                            if let Err(e) = retry_do(|| route_replace(nl, vxr)).await {
+                            if let Err(e) = retry_do(ctx, || route_replace(nl, vxr)).await {
                                 error!(
                                     "failed to add v6 vxlanRoute ({v6_sn} -> {}): {e}",
                                     v6_sn.ip
                                 );
-                                if let Err(e) = retry_do(|| del_arp(nl, dev, mac, gw)).await {
+                                if let Err(e) = retry_do(ctx, || del_arp(nl, dev, mac, gw)).await {
                                     error!("DelV6ARP failed: {e}");
                                 }
-                                if let Err(e) = retry_do(|| del_fdb(nl, dev, mac, vtep)).await {
+                                if let Err(e) = retry_do(ctx, || del_fdb(nl, dev, mac, vtep)).await
+                                {
                                     error!("DelV6FDB failed: {e}");
                                 }
                                 continue;
@@ -245,7 +252,7 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
                                 "Removing direct route to subnet: {sn} PublicIP: {}",
                                 attrs.public_ip
                             );
-                            if let Err(e) = retry_do(|| route_del(nl, dr)).await {
+                            if let Err(e) = retry_do(ctx, || route_del(nl, dr)).await {
                                 error!("Error deleting route to {sn} via {}: {e}", attrs.public_ip);
                             }
                         } else {
@@ -255,13 +262,13 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
                                 mac_to_string(mac)
                             );
                             // Remove all entries; do not bail on one failure.
-                            if let Err(e) = retry_do(|| del_arp(nl, dev, mac, gw)).await {
+                            if let Err(e) = retry_do(ctx, || del_arp(nl, dev, mac, gw)).await {
                                 error!("DelARP failed: {e}");
                             }
-                            if let Err(e) = retry_do(|| del_fdb(nl, dev, mac, vtep)).await {
+                            if let Err(e) = retry_do(ctx, || del_fdb(nl, dev, mac, vtep)).await {
                                 error!("DelFDB failed: {e}");
                             }
-                            if let Err(e) = retry_do(|| route_del(nl, vxr)).await {
+                            if let Err(e) = retry_do(ctx, || route_del(nl, vxr)).await {
                                 error!("failed to delete vxlanRoute ({sn} -> {}): {e}", sn.ip);
                             }
                         }
@@ -284,7 +291,7 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
                                 "Removing v6 direct route to subnet: {} PublicIP: {pub6}",
                                 event.lease.subnet
                             );
-                            if let Err(e) = retry_do(|| route_del(nl, dr)).await {
+                            if let Err(e) = retry_do(ctx, || route_del(nl, dr)).await {
                                 error!("Error deleting v6 route to {v6_sn} via {pub6}: {e}");
                             }
                         } else {
@@ -292,13 +299,13 @@ pub(super) async fn handle_subnet_events(nl: &Netlink, state: &Mutex<NetState>, 
                                 "removing v6subnet: {v6_sn} PublicIPv6: {pub6} VtepMAC: {}",
                                 mac_to_string(mac)
                             );
-                            if let Err(e) = retry_do(|| del_arp(nl, dev, mac, gw)).await {
+                            if let Err(e) = retry_do(ctx, || del_arp(nl, dev, mac, gw)).await {
                                 error!("DelV6ARP failed: {e}");
                             }
-                            if let Err(e) = retry_do(|| del_fdb(nl, dev, mac, vtep)).await {
+                            if let Err(e) = retry_do(ctx, || del_fdb(nl, dev, mac, vtep)).await {
                                 error!("DelV6FDB failed: {e}");
                             }
-                            if let Err(e) = retry_do(|| route_del(nl, vxr)).await {
+                            if let Err(e) = retry_do(ctx, || route_del(nl, vxr)).await {
                                 error!(
                                     "failed to delete v6 vxlanRoute ({v6_sn} -> {}): {e}",
                                     v6_sn.ip
@@ -375,7 +382,9 @@ async fn route_del(nl: &Netlink, msg: &RouteMessage) -> anyhow::Result<()> {
 /// Port of flannel's `retry.Do` (avast/retry-go/v4 defaults): 10 attempts,
 /// exponential delay starting at 100ms, logging each retry like Go's
 /// OnRetry hook ("#%d: %s\n").
-async fn retry_do<F, Fut>(mut f: F) -> anyhow::Result<()>
+/// Go deviation: `retry.Do` has no context; here the backoff sleep races
+/// `ctx` so shutdown never waits out the exponential delay.
+async fn retry_do<F, Fut>(ctx: Ctx<'_>, mut f: F) -> anyhow::Result<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
@@ -388,7 +397,11 @@ where
             Err(e) if attempt + 1 == ATTEMPTS => return Err(e),
             Err(e) => {
                 error!("#{attempt}: {e}\n");
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancelled() => return Err(anyhow!("context canceled")),
+                    _ = tokio::time::sleep(delay) => {}
+                }
                 delay *= 2;
             }
         }

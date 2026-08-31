@@ -169,7 +169,8 @@ pub fn version_at_least(a: &str, b: &str) -> bool {
 /// - `ipam`: `{type: "host-local"}` + user delegate.ipam overrides, then
 ///   flannel injects `ranges` (cniVersion >= 0.3.0) or a flat `subnet`
 ///   (legacy; IPv6 unsupported there) and default routes when the user
-///   supplied none;
+///   supplied none in either `delegate.ipam.routes` or delegate-level
+///   `routes`;
 /// - at least one of FLANNEL_SUBNET / FLANNEL_IPV6_SUBNET is required.
 pub fn build_delegate_conf(conf: &NetConf, env: &FlannelSubnetEnv) -> Result<Value> {
     if env.subnet.is_none() && env.ipv6_subnet.is_none() {
@@ -241,7 +242,9 @@ fn build_ipam(conf: &NetConf, env: &FlannelSubnetEnv) -> Result<Value> {
             ),
         }
     }
-    if !conf.delegate.contains_key("routes") {
+    if !user_routes_present(conf) {
+        // Flannel injects default routes only when the user supplied
+        // none (CNI spec: user ipam config is not clobbered).
         let mut routes = Vec::new();
         if env.subnet.is_some() {
             routes.push(json!({"dst": "0.0.0.0/0"}));
@@ -252,4 +255,16 @@ fn build_ipam(conf: &NetConf, env: &FlannelSubnetEnv) -> Result<Value> {
         ipam.insert("routes".into(), Value::Array(routes));
     }
     Ok(Value::Object(ipam))
+}
+
+/// True when the user supplied routes that flannel must not overwrite:
+/// either under `delegate.ipam.routes` (merged into the injected ipam by
+/// [`build_ipam`]) or at the delegate top level (kept verbatim on the
+/// bridge config).
+fn user_routes_present(conf: &NetConf) -> bool {
+    conf.delegate.contains_key("routes")
+        || matches!(
+            conf.delegate.get("ipam"),
+            Some(Value::Object(ipam)) if ipam.contains_key("routes")
+        )
 }

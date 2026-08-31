@@ -107,6 +107,58 @@ fn dispatch_add_del_with_fake_bridge() {
     assert_eq!(dispatch(&args, conf), 1);
 }
 
+/// DEL is best-effort/idempotent (CNI spec): a *readable but empty*
+/// subnet.env (no FLANNEL_SUBNET / FLANNEL_IPV6_SUBNET, e.g. while
+/// flanneld truncates it) must still exit 0 via the minimal delegate
+/// config -- while ADD keeps failing, since it needs a real subnet.
+#[test]
+fn dispatch_del_with_empty_env_file_succeeds() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_bridge(dir.path());
+    let env_file = dir.path().join("subnet.env");
+    std::fs::write(&env_file, "").unwrap();
+    std::env::set_var("FLANNEL_SUBNET_FILE", &env_file);
+    let _guard = SubnetEnvVarGuard;
+
+    let conf = br#"{"cniVersion":"0.4.0","name":"fd","type":"flannel"}"#;
+    let mut args = CniArgs {
+        command: "ADD".into(),
+        container_id: random_container_id(),
+        netns: "/proc/1/ns/net".into(),
+        if_name: "eth0".into(),
+        args: String::new(),
+        path: dir.path().to_str().unwrap().to_string(),
+    };
+    // ADD behavior is unchanged: no subnet -> CNI error, exit 1.
+    assert_eq!(dispatch(&args, conf), 1);
+    // DEL: minimal delegate conf -> fake bridge runs -> exit 0.
+    args.command = "DEL".into();
+    assert_eq!(dispatch(&args, conf), 0);
+}
+
+/// Same for a missing subnet.env: DEL must stay idempotent (exit 0).
+#[test]
+fn dispatch_del_with_missing_env_file_succeeds() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_bridge(dir.path());
+    let env_file = dir.path().join("absent-subnet.env"); // never created
+    std::env::set_var("FLANNEL_SUBNET_FILE", &env_file);
+    let _guard = SubnetEnvVarGuard;
+
+    let conf = br#"{"cniVersion":"0.4.0","name":"fd","type":"flannel"}"#;
+    let args = CniArgs {
+        command: "DEL".into(),
+        container_id: random_container_id(),
+        netns: "/proc/1/ns/net".into(),
+        if_name: "eth0".into(),
+        args: String::new(),
+        path: dir.path().to_str().unwrap().to_string(),
+    };
+    assert_eq!(dispatch(&args, conf), 0);
+}
+
 /// Full ADD + DEL through the real bridge/host-local plugins in a fresh
 /// netns: the whole chain runs *inside* the netns (like `ip netns exec`),
 /// so the bridge that cni-plugins >= 1.2 creates in the caller's

@@ -71,8 +71,8 @@ impl Network for IPsecNetwork {
         self.mtu
     }
 
-    /// Go: `Run`: load the own PSK, then watch lease events and process
-    /// them until the watch ends.
+    /// Go: `Run` (ipsec_network.go:75-108): load the own PSK, spawn the
+    /// lease watch, then process events until the events channel closes.
     fn run<'a>(&'a self, ctx: Ctx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let own_ip = self.lease.attrs.public_ip.to_string();
@@ -83,29 +83,26 @@ impl Network for IPsecNetwork {
 
             info!("Watching for new subnet leases");
             let (ev_tx, mut ev_rx) = mpsc::channel::<Vec<Event>>(1);
-            let watch = watch_leases(ctx, &*self.sm, &self.lease, ev_tx);
-            tokio::pin!(watch);
-            let mut watch_done = false;
 
-            loop {
-                tokio::select! {
-                    biased;
-                    batch = ev_rx.recv() => match batch {
-                        Some(events) => {
-                            info!("Handling event");
-                            handle_subnet_events(ctx, self, &events).await;
-                        }
-                        None => {
-                            info!("evts chan closed");
-                            return;
-                        }
-                    },
-                    _ = &mut watch, if !watch_done => {
-                        watch_done = true;
-                        info!("WatchLeases exited");
-                    }
-                }
+            // Go: `go func() { subnet.WatchLeases(ctx, n.SubnetLease, evts)
+            // }()`. The spawned task owns the sender: when the watch ends
+            // (ctx done or manager end) the channel closes.
+            let watch_task = tokio::spawn({
+                let sm = self.sm.clone();
+                let own_lease = self.lease.clone();
+                let token = ctx.clone();
+                async move { watch_leases(&token, &*sm, &own_lease, ev_tx).await }
+            });
+
+            // Go: `evtsBatch, ok := <-evts; if !ok { log; return }`.
+            while let Some(events) = ev_rx.recv().await {
+                info!("Handling event");
+                handle_subnet_events(ctx, self, &events).await;
             }
+            info!("evts chan closed");
+
+            // Go: `defer wg.Wait()`.
+            let _ = watch_task.await;
         })
     }
 }

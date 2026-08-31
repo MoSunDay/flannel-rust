@@ -250,6 +250,50 @@ fn delegate_conf_user_routes_preserved() {
     assert!(value["ipam"].get("routes").is_none());
 }
 
+/// `delegate.ipam.routes` is spec-standard user ipam config: it must
+/// survive the merge instead of being clobbered by flannel's default
+/// routes (which are only injected when the user supplied none).
+#[test]
+fn delegate_conf_user_ipam_routes_preserved() {
+    let user_routes = json!([
+        {"dst": "192.168.0.0/16"},
+        {"dst": "10.1.0.0/16", "gw": "10.1.0.1"}
+    ]);
+    let conf = netconf(
+        "1.0.0",
+        json!({"ipam": {"routes": user_routes.clone(), "dataDir": "/tmp/ipam"}}),
+    );
+    let value = build_delegate_conf(&conf, &v4_env()).unwrap();
+    // User ipam routes survive verbatim; no 0.0.0.0/0 default injected.
+    assert_eq!(value["ipam"]["routes"], user_routes);
+    // Other user ipam keys and flannel's range injection still apply.
+    assert_eq!(value["ipam"]["dataDir"], json!("/tmp/ipam"));
+    assert_eq!(
+        value["ipam"]["ranges"],
+        json!([[{"subnet": "10.244.7.0/24"}]])
+    );
+    // Nothing is duplicated at the delegate top level either.
+    assert!(value.get("routes").is_none());
+
+    // Dual stack: user routes also suppress the ::/0 default (and vice
+    // versa: delegate-level routes suppress ipam routes injection).
+    let env = FlannelSubnetEnv {
+        ipv6_subnet: Some("fc00:0:0:1::/64".parse().unwrap()),
+        ..v4_env()
+    };
+    let value = build_delegate_conf(&conf, &env).unwrap();
+    assert_eq!(value["ipam"]["routes"], user_routes);
+
+    let conf = netconf(
+        "1.0.0",
+        json!({"routes": [{"dst": "192.168.0.0/16"}],
+               "ipam": {"routes": [{"dst": "10.2.0.0/16"}]}}),
+    );
+    let value = build_delegate_conf(&conf, &env).unwrap();
+    assert_eq!(value["ipam"]["routes"], json!([{"dst": "10.2.0.0/16"}]));
+    assert_eq!(value["routes"], json!([{"dst": "192.168.0.0/16"}]));
+}
+
 #[test]
 fn minimal_delegate_conf_keeps_user_overrides_only() {
     let conf = netconf(

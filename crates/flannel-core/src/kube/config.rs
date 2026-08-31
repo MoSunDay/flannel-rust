@@ -7,6 +7,7 @@
 //! then `~/.kube/config`.
 
 use std::env;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -18,7 +19,7 @@ pub const SERVICE_ACCOUNT_TOKEN: &str = "/var/run/secrets/kubernetes.io/servicea
 pub const SERVICE_ACCOUNT_CA: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 
 /// Everything the client needs to reach the apiserver.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct KubeConfig {
     /// Base URL of the apiserver, e.g. `http://127.0.0.1:6444` or
     /// `https://10.0.0.1:6443` (no trailing slash).
@@ -26,6 +27,22 @@ pub struct KubeConfig {
     pub bearer_token: Option<String>,
     pub ca_path: Option<PathBuf>,
     pub insecure_skip_tls_verify: bool,
+}
+
+/// `Debug` that never prints the bearer token (configs get logged via
+/// `{:?}` in error paths). Presence stays visible, `None` stays `None`.
+impl fmt::Debug for KubeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KubeConfig")
+            .field("server", &self.server)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("ca_path", &self.ca_path)
+            .field("insecure_skip_tls_verify", &self.insecure_skip_tls_verify)
+            .finish()
+    }
 }
 
 /// Config for a bare apiserver URL (k3as/init-pro: plain HTTP, no auth).

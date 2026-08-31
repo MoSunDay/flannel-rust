@@ -11,6 +11,7 @@ Commit: 2f979c2
 ## 核心链路
 1. 解析 flags → 选 iface → 构造 kube subnet manager
 2. acquire lease → 启动 backend（registry 按 `--backend-type` 取）
+   - 生命周期语义：`run()`=`run_inner()` 包装，所有退出路径 cancel+drain 任务（嵌入安全）；`Options::install_signal_handlers=false` 供嵌入方自装信号（默认 true=Go）；类型化 `Canceled`/`Interrupted` 哨兵 downcast；CompleteLease 失败仅记日志 exit 0（Go main.go:500-513 parity）
 3. 写 subnet.env → 装配 trafficmngr（iptables/nftables）→ watch lease 变更 → healthz 循环
 
 ## 依赖与接口

@@ -8,6 +8,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -57,7 +58,14 @@ pub struct KubeClient {
 
 impl KubeClient {
     pub fn new(config: KubeConfig) -> Result<Self, KubeError> {
-        let mut builder = reqwest::Client::builder().use_rustls_tls();
+        // Bounded dial (30s, like the client-go transport Go flannel uses):
+        // without it a black-holed apiserver stalls every non-watch call
+        // for minutes. There is deliberately NO global `.timeout()`: the
+        // watch streams (`watch_nodes`) are long-polls that must stay
+        // unbounded for as long as the apiserver keeps them open.
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .use_rustls_tls();
         if let Some(token) = &config.bearer_token {
             let mut headers = reqwest::header::HeaderMap::new();
             let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))

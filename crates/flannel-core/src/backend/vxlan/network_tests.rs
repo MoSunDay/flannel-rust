@@ -5,22 +5,28 @@ use super::device::{new_vxlan_device, VXLANAttrs, VXLANDevice};
 use super::events::handle_subnet_events;
 use super::fake::{netns_block_on, setup_ext_iface, test_config, vxlan_backend_data, FakeManager};
 use super::link_info::{get_link_by_name, link_kind, vxlan_info};
-use super::network::NetState;
+use super::network::{NetState, VXLANNetwork};
 use super::new_backend;
 use crate::backend::common::ExternalInterface;
+use crate::backend::traits::Network;
 use crate::ip::iface::Netlink;
 use crate::ip::{IP4Net, IP6Net, IP4};
-use crate::lease::{Event, EventType, Lease};
+use crate::lease::{Event, EventType, Lease, LeaseAttrs, LeaseWatchResult};
 use crate::mac::{mac_to_string, MacAddr};
+use crate::subnet::config::Config;
+use crate::subnet::manager::{Ctx, Manager};
 use anyhow::anyhow;
+use futures::future::BoxFuture;
 use futures::stream::TryStreamExt;
 use netlink_packet_route::link::InfoKind;
 use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use netlink_packet_route::route::RouteAttribute;
 use netlink_packet_route::AddressFamily;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const VTEP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1));
@@ -177,11 +183,12 @@ fn register_network_creates_devices_and_lease() {
 fn events_add_and_remove_encapsulated_route() {
     netns_block_on("flnl_vx_events_encap", async {
         let nl = Netlink::new().await?;
+        let tok = CancellationToken::new();
         let ext_index = setup_ext_iface(&nl, "ext0", Some((VTEP, 24)), None).await?;
         let dev = local_dev(&nl, ext_index, false).await?;
         let state = Mutex::new(NetState { dev: Some(dev.clone()), v6_dev: None, mtu: 1450 });
 
-        handle_subnet_events(&nl, &state, &[peer_event(EventType::Added, false)]).await;
+        handle_subnet_events(&tok, &nl, &state, &[peer_event(EventType::Added, false)]).await;
 
         // ARP entry for the remote subnet IP, FDB for the remote VTEP.
         let neigh: Vec<_> = nl.handle.neighbours().get().set_address_family(AddressFamily::Inet).execute().try_collect().await.map_err(|e| anyhow!("{e}"))?;
@@ -195,7 +202,7 @@ fn events_add_and_remove_encapsulated_route() {
         assert!(has_route(&nl, AddressFamily::Inet, IpAddr::V4(Ipv4Addr::new(10, 1, 2, 0)), 24,
             Some(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 0))), dev.ifindex).await?);
 
-        handle_subnet_events(&nl, &state, &[peer_event(EventType::Removed, false)]).await;
+        handle_subnet_events(&tok, &nl, &state, &[peer_event(EventType::Removed, false)]).await;
 
         assert!(!has_route(&nl, AddressFamily::Inet, IpAddr::V4(Ipv4Addr::new(10, 1, 2, 0)), 24,
             Some(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 0))), dev.ifindex).await?);
@@ -211,6 +218,7 @@ fn events_add_and_remove_encapsulated_route() {
 fn events_add_and_remove_direct_route() {
     netns_block_on("flnl_vx_events_direct", async {
         let nl = Netlink::new().await?;
+        let tok = CancellationToken::new();
         let ext_index = setup_ext_iface(&nl, "ext0", Some((VTEP, 24)), None).await?;
         // Peer VTEP must be directly reachable: give the ns a matching
         // interface (Go's direct_routing() = route lookup has no gateway).
@@ -228,7 +236,7 @@ fn events_add_and_remove_direct_route() {
             mtu: 1450,
         });
 
-        handle_subnet_events(&nl, &state, &[peer_event(EventType::Added, true)]).await;
+        handle_subnet_events(&tok, &nl, &state, &[peer_event(EventType::Added, true)]).await;
 
         // directRoute: dst 10.1.2.0/24 via the peer's public IP.
         assert!(
@@ -255,7 +263,7 @@ fn events_add_and_remove_direct_route() {
             .await?
         );
 
-        handle_subnet_events(&nl, &state, &[peer_event(EventType::Removed, true)]).await;
+        handle_subnet_events(&tok, &nl, &state, &[peer_event(EventType::Removed, true)]).await;
         assert!(
             !has_route(
                 &nl,
@@ -267,6 +275,170 @@ fn events_add_and_remove_direct_route() {
             )
             .await?
         );
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The node's own lease: a subnet distinct from the peer event's so the
+/// wrapper's LeaseWatcher does not filter it out.
+fn own_lease() -> Lease {
+    Lease {
+        enable_ipv4: true,
+        enable_ipv6: false,
+        subnet: IP4Net {
+            ip: IP4::from_bytes([10, 99, 0, 0]),
+            prefix_len: 24,
+        },
+        ipv6_subnet: IP6Net::default(),
+        attrs: LeaseAttrs::default(),
+        expiration: SystemTime::now() + Duration::from_secs(3600),
+        asof: 0,
+    }
+}
+
+/// Manager for the `run()` test: the first watch session fails (Go's
+/// `sm.WatchLeases` goroutine logs and returns, leaving its channel
+/// open -- subnet.go:120-127), later sessions deliver one peer-added
+/// batch and then park until ctx is cancelled. The session sender is
+/// held for the session's lifetime: dropping it early would look like
+/// an ended session to the watch wrapper.
+struct RunManager(AtomicU32);
+
+impl RunManager {
+    fn attempts(&self) -> u32 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Manager for RunManager {
+    fn get_network_config<'a>(&'a self, _ctx: Ctx<'a>) -> BoxFuture<'a, anyhow::Result<Config>> {
+        Box::pin(async { Ok(Config::default()) })
+    }
+    fn handle_subnet_file<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a Config,
+        _: bool,
+        _: IP4Net,
+        _: IP6Net,
+        _: u32,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn acquire_lease<'a>(
+        &'a self,
+        _ctx: Ctx<'a>,
+        _attrs: &'a LeaseAttrs,
+    ) -> BoxFuture<'a, anyhow::Result<Lease>> {
+        Box::pin(async { anyhow::bail!("not used") })
+    }
+    fn renew_lease<'a>(
+        &'a self,
+        _ctx: Ctx<'a>,
+        lease: &'a Lease,
+    ) -> BoxFuture<'a, anyhow::Result<Lease>> {
+        Box::pin(async move { Ok(lease.clone()) })
+    }
+    fn watch_lease<'a>(
+        &'a self,
+        _ctx: Ctx<'a>,
+        _: IP4Net,
+        _: IP6Net,
+        _: mpsc::Sender<Vec<LeaseWatchResult>>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn watch_leases<'a>(
+        &'a self,
+        ctx: Ctx<'a>,
+        tx: mpsc::Sender<Vec<LeaseWatchResult>>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("boom");
+            }
+            let _ = tx
+                .send(vec![LeaseWatchResult {
+                    events: vec![peer_event(EventType::Added, false)],
+                    snapshot: vec![],
+                }])
+                .await;
+            let _keep_open = tx;
+            ctx.cancelled().await;
+            Ok(())
+        })
+    }
+    fn complete_lease<'a>(
+        &'a self,
+        _ctx: Ctx<'a>,
+        _lease: &'a Lease,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn get_stored_mac_addresses<'a>(&'a self, _c: Ctx<'a>) -> BoxFuture<'a, (String, String)> {
+        Box::pin(async { (String::new(), String::new()) })
+    }
+    fn get_stored_public_ip<'a>(&'a self, _c: Ctx<'a>) -> BoxFuture<'a, (String, String)> {
+        Box::pin(async { (String::new(), String::new()) })
+    }
+    fn name(&self) -> String {
+        "run".to_string()
+    }
+}
+
+/// run() must survive a failed watch session (the wrapper re-establishes
+/// it, Go's dead watch goroutine just parks the run loop) and must
+/// program the state an event batch describes; on cancellation it must
+/// return promptly and join its watchers.
+#[test]
+fn run_survives_watch_error_serves_events_and_cancels() {
+    netns_block_on("flnl_vx_run", async {
+        let nl = Netlink::new().await?;
+        let ext_index = setup_ext_iface(&nl, "ext0", Some((VTEP, 24)), None).await?;
+        let dev = local_dev(&nl, ext_index, false).await?;
+
+        let rm = Arc::new(RunManager(AtomicU32::new(0)));
+        let net = VXLANNetwork::new(
+            rm.clone(),
+            Arc::new(ExternalInterface::default()),
+            own_lease(),
+            Some(dev.clone()),
+            None,
+            1450,
+        );
+
+        let tok = CancellationToken::new();
+        let run_tok = tok.clone();
+        let handle = tokio::spawn(async move { net.run(&run_tok).await });
+
+        // Session 1 fails; the retried session 2 delivers the peer-added
+        // batch through run()'s select loop (vxlanRoute + ARP + FDB).
+        let mut programmed = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if has_route(
+                &nl,
+                AddressFamily::Inet,
+                IpAddr::V4(Ipv4Addr::new(10, 1, 2, 0)),
+                24,
+                Some(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 0))),
+                dev.ifindex,
+            )
+            .await?
+            {
+                programmed = true;
+                break;
+            }
+        }
+        assert!(programmed, "peer route never programmed after watch retry");
+        assert!(rm.attempts() >= 2, "failed watch session was not retried");
+
+        tok.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run() should return after cancellation")
+            .unwrap();
         Ok(())
     })
     .unwrap();

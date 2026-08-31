@@ -36,16 +36,22 @@ pub fn cmd_add(args: &skel::CniArgs, conf_bytes: &[u8]) -> Result<serde_json::Va
     Ok(result)
 }
 
-/// CNI DEL: delegate; always succeed (DEL must be idempotent).
+/// CNI DEL: delegate; always succeed (DEL must be best-effort and
+/// idempotent, see the CNI spec).
 pub fn cmd_del(args: &skel::CniArgs, conf_bytes: &[u8]) -> Result<()> {
     let conf = netconf::load_flannel_net_conf(conf_bytes)?;
     let delegate_conf = match netconf::load_flannel_subnet_env(&netconf::default_subnet_env_path())
+        .and_then(|env| netconf::build_delegate_conf(&conf, &env))
     {
-        Ok(env) => netconf::build_delegate_conf(&conf, &env)?,
+        Ok(delegate_conf) => delegate_conf,
         Err(e) => {
-            // subnet.env may be gone after flanneld restart; still try the
-            // delegate with a minimal config so cleanup can proceed.
-            tracing::warn!("DEL: subnet.env unavailable ({e:#}); using delegate overrides only");
+            // Missing *or* broken subnet.env (flanneld may have
+            // removed/truncated it, or it may lack FLANNEL_SUBNET):
+            // none of that may fail cleanup, so fall back to the
+            // delegate overrides alone and let the plugin tear down.
+            eprintln!(
+                "flannel-cni: DEL: subnet.env unusable ({e:#}); using delegate overrides only"
+            );
             netconf::minimal_delegate_conf(&conf)?
         }
     };

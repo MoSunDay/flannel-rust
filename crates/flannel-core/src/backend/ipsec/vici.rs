@@ -33,6 +33,15 @@ const KEY_VALUE: u8 = 3;
 const LIST_START: u8 = 4;
 const LIST_ITEM: u8 = 5;
 const LIST_END: u8 = 6;
+/// Upper bound on one VICI packet's frame length (length word is u32 BE
+/// and includes the type byte). Every value/list item on the wire is
+/// itself capped by a u16 length, and flannel only exchanges
+/// load-conn/load-shared/unload-conn requests plus their tiny
+/// success/error replies, so 64 KiB (the size of this crate's netlink
+/// recv buffers) is far above any legitimate frame. A hung or
+/// compromised charon can send an arbitrary length word, so anything
+/// larger must fail instead of becoming a huge allocation.
+const MAX_PACKET_LEN: usize = 64 * 1024;
 /// One ordered segment of a VICI message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ViciSegment {
@@ -252,6 +261,14 @@ fn read_packet(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
     let len = u32::from_be_bytes(len_buf) as usize;
     if len == 0 {
         return Err(io::Error::new(ErrorKind::InvalidData, "empty VICI packet"));
+    }
+    if len > MAX_PACKET_LEN {
+        // Fail before allocating: the length word is unframed input
+        // from charon, so it cannot be trusted to size a buffer.
+        tracing::warn!("VICI packet length {len} exceeds the {MAX_PACKET_LEN}-byte limit");
+        return Err(bad(format!(
+            "VICI packet length {len} exceeds the {MAX_PACKET_LEN}-byte limit"
+        )));
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;

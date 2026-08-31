@@ -256,3 +256,19 @@ fn resolve_explicit_args_and_env_fallbacks() {
         }
     }
 }
+
+/// `Debug` must never leak the bearer token, but must keep telling the
+/// reader whether one is present (and keep `None` accurate).
+#[test]
+fn debug_redacts_the_bearer_token() {
+    let mut cfg = from_api_url("http://127.0.0.1:6444").unwrap();
+    cfg.bearer_token = Some("super-secret-token".to_string());
+    let rendered = format!("{cfg:?}");
+    assert!(!rendered.contains("super-secret-token"));
+    assert!(rendered.contains("bearer_token: Some(\"<redacted>\")"));
+    assert!(rendered.contains("server: \"http://127.0.0.1:6444\""));
+
+    // Tokenless configs still render as None.
+    let cfg = from_api_url("http://127.0.0.1:6444").unwrap();
+    assert!(format!("{cfg:?}").contains("bearer_token: None"));
+}

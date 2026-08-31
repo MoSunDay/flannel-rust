@@ -169,3 +169,171 @@ async fn daemon_rejects_etcd_mode() {
     let code = flanneld::run(opts, CancellationToken::new()).await.unwrap();
     assert_eq!(code, 1);
 }
+
+/// Common setup for the scenario tests: mock apiserver with a node, a
+/// temp net-conf.json + subnet.env, and parsed `Options` pointing at
+/// them. `backend_type` lands in the net-conf Backend.Type.
+async fn scenario_opts(
+    api: &MockApiserver,
+    dir: &tempfile::TempDir,
+    backend_type: &str,
+    extra: &[String],
+) -> (std::path::PathBuf, flanneld::Options) {
+    let conf_path = dir.path().join("net-conf.json");
+    std::fs::write(
+        &conf_path,
+        format!(r#"{{"Network": "10.244.0.0/16", "Backend": {{"Type": "{backend_type}"}}}}"#),
+    )
+    .unwrap();
+    let subnet_file = dir.path().join("subnet.env");
+
+    // Build opts through the real flag set (Go-equivalent defaults),
+    // overriding only what points at the mock and temp paths.
+    let mut fs = build_flag_set();
+    let mut args: Vec<String> = vec![
+        "--kube-subnet-mgr".into(),
+        format!("--kube-api-url={}", api.url()),
+        format!("--net-config-path={}", conf_path.display()),
+        format!("--subnet-file={}", subnet_file.display()),
+        "--healthz-port=0".into(),
+    ];
+    args.extend_from_slice(extra);
+    fs.parse(&args).unwrap();
+    let opts = options_from_flag_set(&fs);
+    (subnet_file, opts)
+}
+
+/// Wait (bounded) until `f` turns true; keeps the single-threaded test
+/// runtime polling while the daemon task runs.
+async fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f()
+}
+
+/// Go main.go:502-513 CompleteLease parity: when CompleteLease fails
+/// (here: the /status patch is rejected, the only kube-mode error path,
+/// pkg/subnet/kube/kube.go:639-675) Go only logs it and does NOT cancel
+/// — the kube manager can never produce errInterrupted — so the daemon
+/// keeps running, and still exits 0 when shutdown arrives.
+#[tokio::test]
+async fn complete_lease_failure_keeps_daemon_running_then_exits_zero() {
+    init_tracing();
+    let _guard = ENV_LOCK.lock().await;
+    let _node = EnvGuard::set_node_name("e2e-node");
+
+    let api = MockApiserver::start().await;
+    api.put_node("e2e-node", "10.244.1.0/24");
+    api.fail_status_patches();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (subnet_file, opts) = scenario_opts(&api, &dir, "alloc", &[]).await;
+
+    let cancel = CancellationToken::new();
+    let run_task = tokio::spawn(flanneld::run(opts, cancel.clone()));
+
+    // The daemon gets all the way to READY before complete_lease runs.
+    wait_for_file(&subnet_file, Duration::from_secs(30))
+        .await
+        .expect("daemon wrote subnet.env within 30s");
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            api.status_patch_failures() > 0
+        })
+        .await,
+        "complete_lease's status patch attempted"
+    );
+
+    // A failed CompleteLease must NOT stop the daemon (no cancel, no
+    // early exit): it is still running after the failure.
+    assert!(
+        !run_task.is_finished(),
+        "daemon died on CompleteLease error"
+    );
+
+    // Shutdown arrives -> clean exit 0 (main.go:509-513).
+    cancel.cancel();
+    let code = tokio::time::timeout(Duration::from_secs(15), run_task)
+        .await
+        .expect("daemon exited after cancel")
+        .unwrap()
+        .unwrap();
+    assert_eq!(code, 0);
+}
+
+/// Go main.go:553 + 587-591: the raw --healthz-port int goes to
+/// net.JoinHostPort; 70000 fails ListenAndServe ("invalid port") and Go
+/// aborts. The port maps that to the startup-failure path: exit 1 — NOT
+/// a silent `as u16` wrap to 4464 — with the token cancelled and the
+/// spawned tasks drained.
+#[tokio::test]
+async fn healthz_port_out_of_range_exits_one() {
+    init_tracing();
+    let _guard = ENV_LOCK.lock().await;
+    let _node = EnvGuard::set_node_name("e2e-node");
+
+    let api = MockApiserver::start().await;
+    api.put_node("e2e-node", "10.244.1.0/24");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_, opts) = scenario_opts(&api, &dir, "alloc", &["--healthz-port=70000".to_string()]).await;
+
+    let cancel = CancellationToken::new();
+    let code = tokio::time::timeout(Duration::from_secs(60), flanneld::run(opts, cancel.clone()))
+        .await
+        .expect("startup failure surfaces within 60s")
+        .unwrap();
+    assert_eq!(code, 1);
+    assert!(cancel.is_cancelled(), "exit path cancels the token");
+}
+
+/// Embedder mode (`install_signal_handlers == false`) with a startup
+/// failure (unknown backend type, Go main.go:367-372: cancel();
+/// wg.Wait(); os.Exit(1)): run must return 1, cancel the token and
+/// drain every spawned task — observable by the healthz port becoming
+/// rebindable — with NO signal-handler task ever spawned.
+#[tokio::test]
+async fn embedder_startup_failure_cancels_token_and_drains_tasks() {
+    init_tracing();
+    let _guard = ENV_LOCK.lock().await;
+    let _node = EnvGuard::set_node_name("e2e-node");
+
+    let api = MockApiserver::start().await;
+    api.put_node("e2e-node", "10.244.1.0/24");
+
+    // Reserve a free port for the healthz listener, then release it.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let healthz_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_, mut opts) = scenario_opts(
+        &api,
+        &dir,
+        "no-such-backend",
+        &[format!("--healthz-port={healthz_port}")],
+    )
+    .await;
+    opts.install_signal_handlers = false;
+
+    let cancel = CancellationToken::new();
+    let code = tokio::time::timeout(Duration::from_secs(60), flanneld::run(opts, cancel.clone()))
+        .await
+        .expect("startup failure surfaces within 60s")
+        .unwrap();
+    assert_eq!(code, 1, "unknown backend type exits 1");
+    assert!(cancel.is_cancelled(), "exit path cancels the token");
+
+    // Tasks drained: the healthz listener was released (the server task
+    // ends only on cancellation, so a successful rebind proves both).
+    let rebindable = wait_until(Duration::from_secs(5), || {
+        std::net::TcpListener::bind(("127.0.0.1", healthz_port)).is_ok()
+    })
+    .await;
+    assert!(rebindable, "healthz listener drained (port rebindable)");
+}

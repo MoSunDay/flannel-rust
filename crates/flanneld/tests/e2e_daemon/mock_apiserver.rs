@@ -18,6 +18,11 @@ struct MockState {
     nodes: BTreeMap<String, Value>,
     rv: u64,
     patches: Vec<(String, String, Value)>,
+    /// When set, PATCH .../status requests fail with 500 (error
+    /// injection for the Go main.go:502-513 CompleteLease parity test).
+    fail_status_patches: bool,
+    /// How many status patches were rejected by the knob above.
+    status_patch_failures: u64,
 }
 
 #[derive(Clone)]
@@ -38,7 +43,7 @@ impl MockApiserver {
             .route(
                 // Go PatchStatus: status.conditions writes land here.
                 "/api/v1/nodes/{name}/status",
-                get(get_node).patch(patch_node),
+                get(get_node).patch(patch_node_status),
             )
             .with_state(api.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -90,6 +95,16 @@ impl MockApiserver {
     /// Recorded PATCH requests: (content-type, node name, body).
     pub(crate) fn patches(&self) -> Vec<(String, String, Value)> {
         self.state.lock().unwrap().patches.clone()
+    }
+
+    /// Make subsequent PATCH .../status requests fail with 500.
+    pub(crate) fn fail_status_patches(&self) {
+        self.state.lock().unwrap().fail_status_patches = true;
+    }
+
+    /// How many status patches the fail knob rejected so far.
+    pub(crate) fn status_patch_failures(&self) -> u64 {
+        self.state.lock().unwrap().status_patch_failures
     }
 }
 
@@ -159,6 +174,39 @@ async fn patch_node(
     node["metadata"]["resourceVersion"] = json!(st.rv.to_string());
     st.nodes.insert(name, node.clone());
     Json(node).into_response()
+}
+
+/// PATCH .../status: same merge logic as `patch_node`, but fails with a
+/// kube-style 500 when the `fail_status_patches` knob is set (injects a
+/// CompleteLease failure for the Go main.go:502-513 exit-code test).
+async fn patch_node_status(
+    State(api): State<MockApiserver>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // Snapshot + release the lock before awaiting (the guard is !Send,
+    // which would break the axum Handler impl).
+    let fail = {
+        let mut st = api.state.lock().unwrap();
+        if st.fail_status_patches {
+            st.status_patch_failures += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if fail {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "kind": "Status", "code": 500, "reason": "InternalError",
+                "message": "injected status patch failure",
+            })),
+        )
+            .into_response();
+    }
+    patch_node(State(api), Path(name), headers, body).await
 }
 
 async fn list_or_watch_nodes(

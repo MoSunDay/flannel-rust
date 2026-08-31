@@ -29,6 +29,9 @@ mod status;
 mod watch_ops;
 
 #[cfg(test)]
+#[path = "events_tests.rs"]
+mod events_tests;
+#[cfg(test)]
 #[path = "hub_tests.rs"]
 mod hub_tests;
 #[cfg(test)]
